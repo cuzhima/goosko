@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Сертификат готов | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>✅ SSH-сертификат готов</h1>
+
+<p>
+    Действителен <strong>{{ ttl }} мин</strong>, до <strong>{{ expires }}</strong> (UTC).
+</p>
+
+<div class="flash">
+    ⚠️ Приватный ключ показывается <strong>один раз</strong>.
+    Сохрани его сейчас — повторно скачать можно только по ссылке ниже и только 10 минут.
+</div>
+
+<div class="card">
+    <h2>💾 Скачать файлы</h2>
+    <div class="file-actions">
+        <a class="btn primary" href="{{ url_for('ssh_download', token=token, kind='key') }}">
+            🔑 Приватный ключ (goosko_key)
+        </a>
+        <a class="btn" href="{{ url_for('ssh_download', token=token, kind='cert') }}">
+            📜 Сертификат (goosko_key-cert.pub)
+        </a>
+        <a class="btn" href="{{ url_for('ssh_download', token=token, kind='bundle') }}">
+            📦 Bundle для Termius (ключ + сертификат)
+        </a>
+    </div>
+    <p class="muted">Ссылки живут 10 минут.</p>
+</div>
+
+<div class="card">
+    <h2>🔑 Приватный ключ</h2>
+    <textarea readonly rows="8" onclick="this.select()">{{ priv }}</textarea>
+    <button class="btn small" type="button" data-copy="{{ priv }}">📋 Копировать</button>
+</div>
+
+<div class="card">
+    <h2>📜 Сертификат</h2>
+    <textarea readonly rows="4" onclick="this.select()">{{ cert }}</textarea>
+    <button class="btn small" type="button" data-copy="{{ cert }}">📋 Копировать</button>
+</div>
+
+<div class="card">
+    <h2>📱 Подключение в Termius</h2>
+    <ol>
+        <li>Termius → <strong>Keychain</strong> → <strong>Keys</strong> → Add → вставь приватный ключ, имя: <code>GOOSKO temp #{{ cert_id }}</code>.</li>
+        <li>Termius → <strong>Keychain</strong> → <strong>Certificates</strong> (или настройки ключа) → Add → вставь сертификат.</li>
+        <li>Создай Host: адрес <code>{{ host_hint }}</code>, порт <code>22</code>, пользователь <code>{{ principal }}</code>.</li>
+        <li>В настройках Host → Authentication выбери ключ <code>GOOSKO temp #{{ cert_id }}</code> (сертификат подцепится автоматически).</li>
+        <li>Connect. Готово до {{ expires }} UTC.</li>
+    </ol>
+</div>
+
+<div class="card">
+    <h2>💻 Подключение из терминала</h2>
+    <p>Положи оба файла в одну папку и выполни:</p>
+    <pre>chmod 600 goosko_key
+ssh -i goosko_key -o CertificateFile=goosko_key-cert.pub {{ principal }}@{{ host_hint }}</pre>
+    <p class="muted">OpenSSH также подхватит сертификат автоматически, если файл лежит рядом с ключом и называется <code>goosko_key-cert.pub</code>.</p>
+</div>
+
+<a class="btn" href="{{ url_for('ssh_page') }}">← К списку сертификатов</a>
+{% endblock %}

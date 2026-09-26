@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+
+{% block title %}Облако | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>☁️ Облачное хранилище</h1>
+
+<p class="muted">
+    Максимальный размер файла: 4 ГБ.<br>
+    Обычные пользователи имеют квоту 20 ГБ. Администраторы не ограничены.
+</p>
+
+<div class="grid two">
+    <div class="card">
+        <h2>📤 Загрузить файл</h2>
+
+        <form
+            method="post"
+            action="{{ url_for('cloud_upload') }}"
+            enctype="multipart/form-data"
+            data-upload-progress
+            data-redirect="/cloud"
+        >
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <label class="file-drop" data-file-drop>
+                <span>Перетащи файл сюда или нажми для выбора</span>
+                <input type="file" name="file" required>
+                <span class="muted" data-file-name>Файл не выбран</span>
+            </label>
+
+            <label class="field radio">
+                <input type="radio" name="zone" value="private" checked>
+                Приватная зона
+            </label>
+
+            <label class="field radio">
+                <input type="radio" name="zone" value="public">
+                Публичная зона
+            </label>
+
+            {% if session.get('is_admin') %}
+                <label class="field">
+                    Загрузить в приватную папку пользователя:
+                    <select name="target_user">
+                        {% for name in users %}
+                            <option value="{{ name }}" {% if name == session['user'] %}selected{% endif %}>
+                                {{ name }}
+                            </option>
+                        {% endfor %}
+                    </select>
+                </label>
+            {% endif %}
+
+            <button class="btn primary" type="submit">☁️ Загрузить</button>
+
+            <div class="progress" hidden>
+                <span></span>
+            </div>
+        </form>
+
+        <p class="muted">
+            Нужно загрузить файл больше 100 МБ?<br>
+            Используй прямую загрузку мимо Cloudflare.
+        </p>
+
+        <a class="btn" href="{{ url_for('cloud_biglink') }}">
+            🎫 Получить ссылку для большой загрузки
+        </a>
+    </div>
+
+    <div class="card">
+        <h2>📊 Квота</h2>
+
+        {% if session.get('is_admin') %}
+            <p><span class="badge ok">Без ограничений</span></p>
+        {% else %}
+            <p>Занято: <strong>{{ usage|human_size }}</strong> из <strong>{{ user_quota|human_size }}</strong></p>
+            <div class="progress" data-progress="{{ quota_percent }}">
+                <span></span>
+            </div>
+        {% endif %}
+
+        <form class="search-form" method="get" action="{{ url_for('cloud') }}">
+            <label class="field">
+                Поиск файлов
+                <input type="search" name="q" value="{{ q }}" placeholder="Имя файла">
+            </label>
+
+            <button class="btn" type="submit">Найти</button>
+        </form>
+
+        {% if q %}
+            <p class="muted">Поиск: {{ q }}</p>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <h2>🌐 Публичная зона ({{ public_files|length }})</h2>
+
+    {% if public_files %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Файл</th>
+                        <th>Владелец</th>
+                        <th>Размер</th>
+                        <th>Создан</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for f in public_files %}
+                    <tr>
+                        <td>🌐 {{ f.name }}</td>
+                        <td>{{ f.owner }}</td>
+                        <td>{{ f.size|human_size }}</td>
+                        <td>{{ f.created_at }}</td>
+                        <td class="file-actions">
+                            <a class="btn small" href="{{ f.url }}" target="_blank" rel="noopener">Открыть</a>
+                            <button class="btn small" type="button" data-copy="{{ f.full_url }}">📋 Копировать</button>
+
+                            {% if f.can_delete %}
+                                <form
+                                    method="post"
+                                    action="{{ url_for('cloud_delete', file_id=f.id) }}"
+                                    data-confirm="Удалить файл в корзину?"
+                                >
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button class="btn small danger" type="submit">🗑️</button>
+                                </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <p>📭 Публичная зона пуста</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>🔒 Приватная зона ({{ private_files|length }})</h2>
+
+    {% if private_files %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Файл</th>
+                        {% if session.get('is_admin') %}
+                            <th>Владелец</th>
+                        {% endif %}
+                        <th>Размер</th>
+                        <th>Создан</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for f in private_files %}
+                    <tr>
+                        <td>🔒 {{ f.name }}</td>
+
+                        {% if session.get('is_admin') %}
+                            <td>{{ f.owner }}</td>
+                        {% endif %}
+
+                        <td>{{ f.size|human_size }}</td>
+                        <td>{{ f.created_at }}</td>
+
+                        <td class="file-actions">
+                            <a class="btn small" href="{{ f.url }}">📥 Скачать</a>
+                            <button class="btn small" type="button" data-copy="{{ f.full_url }}">📋 Копировать</button>
+
+                            <form method="post" action="{{ url_for('share_file', file_id=f.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn small" type="submit">🔗 Поделиться 24ч</button>
+                            </form>
+
+                            {% if f.share_full %}
+                                <button class="btn small" type="button" data-copy="{{ f.share_full }}">
+                                    📋 Временная ссылка
+                                </button>
+                            {% endif %}
+
+                            {% if f.can_delete %}
+                                <form
+                                    method="post"
+                                    action="{{ url_for('cloud_delete', file_id=f.id) }}"
+                                    data-confirm="Удалить файл в корзину?"
+                                >
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button class="btn small danger" type="submit">🗑️</button>
+                                </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <p>📭 Приватная зона пуста</p>
+    {% endif %}
+</div>
+
+<a class="btn" href="/">← Назад в панель</a>
+{% endblock %}

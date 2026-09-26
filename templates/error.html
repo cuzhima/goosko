@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block title %}{{ code }} | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="card auth-card">
+    <h1>{{ icon }} {{ code }}</h1>
+    <h2>{{ title }}</h2>
+    <p>{{ description }}</p>
+    <a class="btn" href="/">🏠 На главную</a>
+</div>
+{% endblock %}

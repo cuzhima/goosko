@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block title %}Вход | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="card auth-card">
+    <h1>Вход</h1>
+    <p class="muted">
+        Здравствуйте и процветайте!<br>
+        Добро пожаловать в автоматизированную систему ГОО "СКО".
+    </p>
+
+    <form method="post" action="{{ url_for('login') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <label class="field">
+            Логин
+            <input name="u" autocomplete="username" required>
+        </label>
+
+        <label class="field">
+            Пароль
+            <input type="password" name="p" autocomplete="current-password" required>
+        </label>
+
+        <button class="btn primary" type="submit">Войти</button>
+    </form>
+</div>
+{% endblock %}

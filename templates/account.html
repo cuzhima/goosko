@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}Аккаунт | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>👤 Аккаунт</h1>
+
+<div class="grid two">
+    <div class="card">
+        <h2>📦 Хранилище</h2>
+
+        {% if session.get('is_admin') %}
+            <p><span class="badge ok">Без ограничений</span></p>
+            <p class="muted">Администраторы не ограничены квотой.</p>
+        {% else %}
+            <p>Занято: <strong>{{ usage|human_size }}</strong> из <strong>{{ user_quota|human_size }}</strong></p>
+            <div class="progress" data-progress="{{ percent }}">
+                <span></span>
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="card">
+        <h2>🔑 Смена пароля</h2>
+
+        <form method="post" action="{{ url_for('account_change_password') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <label class="field">
+                Текущий пароль
+                <input type="password" name="current" autocomplete="current-password" required>
+            </label>
+
+            <label class="field">
+                Новый пароль
+                <input type="password" name="new" autocomplete="new-password" minlength="10" required>
+            </label>
+
+            <label class="field">
+                Повторите новый пароль
+                <input type="password" name="confirm" autocomplete="new-password" minlength="10" required>
+            </label>
+
+            <button class="btn primary" type="submit">Сменить пароль</button>
+        </form>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Панель | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>👋 Здравствуйте, {{ user }}!</h1>
+<p class="muted">Вы успешно вошли в аккаунт. Можете воспользоваться сервисами:</p>
+
+<div class="grid">
+    <div class="card">
+        <h2>💻 Termix</h2>
+        <p>Веб-терминал для управления.</p>
+        <a class="btn" href="https://termix.goosko.online/" target="_blank" rel="noopener">Открыть</a>
+    </div>
+
+    <div class="card">
+        <h2>☁️ Облако</h2>
+        <p>Файловое хранилище.</p>
+        <a class="btn primary" href="/cloud">Открыть облако</a>
+    </div>
+
+    <div class="card">
+        <h2>👤 Аккаунт</h2>
+        <p>Смена пароля и квота.</p>
+        <a class="btn" href="/account">Открыть аккаунт</a>
+    </div>
+</div>
+{% endblock %}
