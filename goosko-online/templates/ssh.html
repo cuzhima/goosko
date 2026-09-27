@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block title %}SSH-доступ | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>🔐 Временный SSH-доступ</h1>
+<p class="muted">
+    Сертификаты подписаны внутренним CA сервера. Срок действия встроен
+    в сертификат — после истечения он перестаёт работать сам.
+</p>
+
+<div class="grid two">
+    <div class="card">
+        <h2>🎫 Выдать сертификат</h2>
+
+        <form method="post" action="{{ url_for('ssh_generate') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <label class="field">
+                Срок действия (минуты, {{ min_ttl }}–{{ max_ttl }})
+                <input type="number" name="ttl" value="60"
+                       min="{{ min_ttl }}" max="{{ max_ttl }}" required>
+            </label>
+
+            <p class="muted">
+                Principal: <code>{{ principal }}</code><br>
+                Адрес для Termius: <code>{{ host_hint }}</code> (порт 22)
+            </p>
+
+            <button class="btn primary" type="submit">🔑 Сгенерировать</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>ℹ️ Как это работает</h2>
+        <ol>
+            <li>Сайт создаёт одноразовую пару ключей Ed25519.</li>
+            <li>Публичный ключ подписывается CA сервера с указанным TTL.</li>
+            <li>Ты импортируешь ключ + сертификат в Termius.</li>
+            <li>По истечении TTL сертификат отклоняется сервером автоматически.</li>
+        </ol>
+    </div>
+</div>
+
+<div class="card">
+    <h2>📜 История сертификатов</h2>
+
+    {% if certs %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Key ID</th>
+                    <th>TTL</th>
+                    <th>Выдан</th>
+                    <th>Действует до</th>
+                    <th>Статус</th>
+                    <th>Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for c in certs %}
+                <tr>
+                    <td>{{ c.id }}</td>
+                    <td><code>{{ c.identity }}</code></td>
+                    <td>{{ c.ttl_minutes }} мин</td>
+                    <td>{{ c.created_at }}</td>
+                    <td>{{ c.expires_at }}</td>
+                    <td>
+                        {% if c.revoked_at %}
+                            <span class="badge danger">Отозван</span>
+                        {% elif c.expires_at > now %}
+                            <span class="badge ok">Активен</span>
+                        {% else %}
+                            <span class="badge">Истёк</span>
+                        {% endif %}
+                    </td>
+                    <td class="file-actions">
+                        {% if not c.revoked_at and c.expires_at > now %}
+                        <form method="post"
+                              action="{{ url_for('ssh_revoke', cert_id=c.id) }}"
+                              data-confirm="Отозвать сертификат #{{ c.id }} до срока?">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button class="btn small danger" type="submit">🚫 Отозвать</button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p>📭 Сертификатов ещё не выдавалось</p>
+    {% endif %}
+</div>
+{% endblock %}

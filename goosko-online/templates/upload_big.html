@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}Большая загрузка | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="card auth-card">
+    <h1>📦 Загрузка больших файлов</h1>
+
+    <p class="muted">
+        Пользователь: {{ user }}.<br>
+        Лимит: 4 ГБ.<br>
+        Канал идёт мимо Cloudflare — напрямую на сервер.
+    </p>
+
+    <form
+        method="post"
+        enctype="multipart/form-data"
+        data-upload-progress
+    >
+        <label class="file-drop" data-file-drop>
+            <span>Перетащи файл сюда или нажми для выбора</span>
+            <input type="file" name="file" required>
+            <span class="muted" data-file-name>Файл не выбран</span>
+        </label>
+
+        <label class="field radio">
+            <input type="radio" name="zone" value="private" checked>
+            Приватная зона
+        </label>
+
+        <label class="field radio">
+            <input type="radio" name="zone" value="public">
+            Публичная зона
+        </label>
+
+        <button class="btn primary" type="submit">📦 Загрузить</button>
+
+        <div class="progress" hidden>
+            <span></span>
+        </div>
+    </form>
+</div>
+{% endblock %}

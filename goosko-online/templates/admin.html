@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+
+{% block title %}Админ-панель | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>⚙️ Панель управления</h1>
+<p class="muted">Добро пожаловать, {{ session['user'] }}!</p>
+
+<div class="grid">
+    <div class="card">
+        <h2>💻 Termix</h2>
+        <p>Веб-терминал для управления.</p>
+        <a class="btn" href="https://termix.goosko.online/" target="_blank" rel="noopener">Открыть</a>
+    </div>
+
+    <div class="card">
+        <h2>📊 Cockpit</h2>
+        <p>Мониторинг сервера.</p>
+        <a class="btn" href="https://admin.goosko.online/" target="_blank" rel="noopener">Открыть</a>
+    </div>
+
+    <div class="card">
+        <h2>☁️ Облако</h2>
+        <p>Файловое хранилище.</p>
+        <a class="btn primary" href="/cloud">Открыть облако</a>
+    </div>
+</div>
+
+<div class="grid two">
+    <div class="card">
+        <h2>👥 Создать пользователя</h2>
+
+        <form method="post" action="{{ url_for('add_user') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <label class="field">
+                Логин
+                <input name="u" required pattern="[A-Za-z0-9._-]{3,32}" title="3-32 символа: латиница, цифры, точка, дефис, нижнее подчеркивание">
+            </label>
+
+            <label class="field">
+                Пароль
+                <input type="password" name="p" required minlength="10">
+            </label>
+
+            <label class="field checkbox">
+                <input type="checkbox" name="admin">
+                Назначить администратором
+            </label>
+
+            <button class="btn primary" type="submit">Создать аккаунт</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>🔑 Безопасность</h2>
+        <p>Смена пароля, квота и настройки аккаунта находятся в разделе «Аккаунт».</p>
+        <a class="btn" href="/account">Перейти к аккаунту</a>
+    </div>
+</div>
+
+<div class="card">
+    <h2>📋 Пользователи ({{ users|length }})</h2>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Пользователь</th>
+                    <th>Роль</th>
+                    <th>Занято</th>
+                    <th>Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in users %}
+                <tr>
+                    <td>🧑 {{ u.username }}</td>
+                    <td>
+                        {% if u.is_admin %}
+                            <span class="badge ok">Admin</span>
+                        {% else %}
+                            <span class="badge">User</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ u.usage|human_size }}</td>
+                    <td class="file-actions">
+                        {% if u.username != 'admin' and u.username != session['user'] %}
+                            <form
+                                method="post"
+                                action="{{ url_for('del_user', uid=u.id) }}"
+                                data-confirm="Удалить пользователя {{ u.username }}? Его файлы будут перемещены в корзину."
+                            >
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn small danger" type="submit">Удалить</button>
+                            </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}
