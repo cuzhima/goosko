@@ -1,4 +1,9 @@
-Flask
-Flask-WTF
-Flask-Limiter
-gunicorn
+# Продакшн-зависимости goosko-online (версии зафиксированы по результатам
+# тестирования; обновление — только через прогон pytest).
+Flask==3.1.1
+Flask-WTF==1.3.0
+Flask-Limiter==4.1.1
+Werkzeug==3.1.3
+WTForms==3.2.2
+limits==5.8.0
+gunicorn>=22.0

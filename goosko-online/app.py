@@ -12,6 +12,7 @@ from flask_limiter.util import get_remote_address
 
 import sqlite3
 import functools
+import atexit
 import os
 import secrets
 import re
@@ -126,6 +127,7 @@ limiter = Limiter(
     app=app,
     default_limits=["200 per hour", "30 per minute"],
     storage_uri="memory://",
+    enabled=os.environ.get("RATELIMIT_ENABLED", "1") == "1",
 )
 
 
@@ -295,6 +297,7 @@ def init_db():
         "user_quota_bytes": str(USER_QUOTA),
         "max_file_size_bytes": str(MAX_FILE_SIZE),
         "share_ttl_hours": str(SHARE_TTL_HOURS),
+        "stream_uploads": os.environ.get("STREAM_UPLOADS", "1"),
     }
     for key, value in defaults.items():
         try:
@@ -340,6 +343,16 @@ def effective_trash_retention_days():
     return max(0, get_int_setting("trash_retention_days", 30))
 
 
+def effective_stream_uploads():
+    """Потоковая (chunked) отдача файлов с Range вместо whole-file send_file."""
+    return get_int_setting("stream_uploads", 1) == 1
+
+
+def effective_camera_max_video_seconds():
+    return max(1, get_int_setting(
+        "camera_max_video_seconds", CAMERA_VIDEO_MAX_SECONDS))
+
+
 def get_db():
     if "db" not in g:
         conn = sqlite3.connect(DB, timeout=15)
@@ -359,6 +372,11 @@ def close_db(exception=None):
 
 
 init_db()
+
+# Фоновая автоочистка корзины/медиа/SSH-бандлов запускается только при
+# реальной работе сервера (не под pytest, чтобы не плодить потоки в тестах).
+if os.environ.get("GOOSKO_DISABLE_MAINTENANCE") != "1":
+    start_background_maintenance()
 
 
 # =====================================================================
@@ -1301,6 +1319,100 @@ def xaccel_public_protected_response(rel_path, filename):
     return response
 
 
+def send_file_response(path, attachment=False):
+    """Отдача файла: Range-стриминг (настраивается) либо whole-file send_file."""
+    if effective_stream_uploads():
+        return send_streamable(
+            path, download_name=os.path.basename(path), attachment=attachment)
+    return send_secure_file(path, attachment=attachment)
+
+
+# =====================================================================
+# RANGE-ЗАПРОСЫ (перемотка видео/аудио в браузере)
+# =====================================================================
+def parse_range_header(range_header, file_size):
+    """Разбирает HTTP Range ('bytes=a-b' / 'bytes=a-' / 'bytes=-N').
+
+    Возвращает (start, end) включительно либо None. Невалидные диапазоны
+    намеренно игнорируются — клиент получит весь файл (без 416).
+    """
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    spec = range_header[6:].split(",")[0].strip()
+    if "-" not in spec:
+        return None
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "":
+            if end_s == "":
+                return None
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(0, file_size - n)
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    if start > end or start >= file_size:
+        return None
+    return start, min(end, file_size - 1)
+
+
+def send_streamable(path, mimetype=None, download_name=None, attachment=False):
+    """Отдача файла с поддержкой Range: 206 Partial Content для срезов."""
+    file_size = os.path.getsize(path)
+    if mimetype is None:
+        import mimetypes
+        mimetype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    disposition = "attachment" if attachment else "inline"
+    if download_name:
+        headers["Content-Disposition"] = (
+            f"{disposition}; filename*=UTF-8''{quote(download_name)}")
+    if attachment or not is_safe_public_filename(os.path.basename(path)):
+        # скачивание / потенциально опасный тип — изолируем от XSS
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+
+    rng = parse_range_header(request.headers.get("Range"), file_size)
+    if rng:
+        start, end = rng
+        length = end - start + 1
+
+        def reader():
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        headers["Content-Length"] = str(length)
+        return Response(reader(), status=206, mimetype=mimetype, headers=headers)
+
+    def full_reader():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    headers["Content-Length"] = str(file_size)
+    return Response(full_reader(), status=200, mimetype=mimetype, headers=headers)
+
+
 # =====================================================================
 # ГЛАВНАЯ
 # =====================================================================
@@ -1860,7 +1972,7 @@ def private_file(username, filename):
     filename_base = os.path.basename(path)
     if USE_X_ACCEL:
         return xaccel_private_response(rel_path, filename_base)
-    return send_secure_file(path, attachment=True)
+    return send_file_response(path, attachment=True)
 
 
 # =====================================================================
@@ -1875,7 +1987,7 @@ def public_file(rel_path):
     if row:
         increment_download(row["id"])
     attachment = not is_safe_public_filename(os.path.basename(path))
-    return send_secure_file(path, attachment=attachment)
+    return send_file_response(path, attachment=attachment)
 
 
 # =====================================================================
@@ -1902,7 +2014,7 @@ def share_download(token):
         if row["zone"] == "private":
             return xaccel_private_response(row["rel_path"], filename_base)
         return xaccel_public_protected_response(row["rel_path"], filename_base)
-    return send_secure_file(path, attachment=True)
+    return send_file_response(path, attachment=True)
 
 
 # =====================================================================
@@ -1972,6 +2084,273 @@ def del_user(uid):
     audit("user_deleted", username)
     flash(f"🗑️ Пользователь {username} удалён, его файлы перемещены в корзину")
     return redirect(url_for("index"))
+
+
+# =====================================================================
+# 💾 АДМИН: РЕЗЕРВНАЯ КОПИЯ (users.db + список файлов хранилища)
+# =====================================================================
+BACKUP_MAX_DB_BYTES = 200 * 1024 * 1024  # не отдаём дампы больше 200 МБ
+
+
+@app.route("/admin/backup")
+@admin_required
+@limiter.limit("6 per hour")
+def admin_backup():
+    """Скачивание tar.gz: консистентный дамп SQLite + манифест хранилища.
+
+    Сами файлы хранилища в архив не кладутся (могут быть ГБ) — вместо них
+    manifest.txt с путями/размерами, чтобы сверить целостность после restore.
+    Для полного бэкапа на сервере используйте deploy/backup.sh + rsync.
+    """
+    import sqlite3
+    import tarfile
+    import tempfile
+
+    if os.path.getsize(DB) > BACKUP_MAX_DB_BYTES:
+        abort(413, description="Слишком большая БД для скачивания из веба")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz", prefix="goosko-backup-")
+    os.close(fd)
+    try:
+        dump_path = tmp_path + ".db"
+        src = sqlite3.connect(DB, timeout=15)
+        dst = sqlite3.connect(dump_path)
+        try:
+            src.backup(dst)  # горячий консистентный дамп (WAL-safe)
+        finally:
+            dst.close()
+            src.close()
+
+        # манифест хранилища
+        manifest_lines = []
+        for zone_dir in (PRIVATE_DIR, PUBLIC_DIR):
+            for root, _dirs, files in os.walk(zone_dir):
+                for fname in sorted(files):
+                    full = os.path.join(root, fname)
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue
+                    rel = os.path.relpath(full, STORAGE_DIR)
+                    manifest_lines.append(f"{rel}\t{st.st_size}\t{int(st.st_mtime)}")
+        manifest_path = tmp_path + ".manifest.txt"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(manifest_lines))
+
+        stamp = utcnow().strftime("%Y%m%d_%H%M%S")
+        out_name = f"goosko-backup_{stamp}.tar.gz"
+        with tarfile.open(tmp_path, "w:gz") as tf:
+            tf.add(dump_path, arcname="users.db")
+            tf.add(manifest_path, arcname="storage_manifest.txt")
+            readme = (
+                "Goosko-online backup.\n"
+                "Restore users.db поверх рабочей копии (сервис должен быть остановлен).\n"
+                "storage_manifest.txt — список файлов хранилища (путь\\tразмер\\tmtime) "
+                "для сверки; сами файлы копируйте с сервера (deploy/backup.sh).\n"
+            ).encode("utf-8")
+            info = tarfile.TarInfo("README.txt")
+            info.size = len(readme)
+            import io as _io
+            tf.addfile(info, _io.BytesIO(readme))
+        os.remove(dump_path)
+        os.remove(manifest_path)
+
+        audit("backup_downloaded", out_name)
+
+        def _cleanup_tmp(path=tmp_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        atexit.register(_cleanup_tmp)  # файл нужен до отправки ответа
+
+        return send_file(
+            tmp_path, as_attachment=True, download_name=out_name,
+            mimetype="application/gzip", conditional=False,
+        )
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# =====================================================================
+# ⚙️ АДМИН: НАСТРОЙКИ СИСТЕМЫ
+# =====================================================================
+EDITABLE_SETTINGS = {
+    # key: (метка, мин, макс, функция применения к человеку)
+    "user_quota_bytes": ("Квота пользователя (байт)", 1024 ** 2, 1024 ** 5, False),
+    "max_file_size_bytes": ("Макс. размер файла (байт)", 1024, 1024 ** 4, False),
+    "share_ttl_hours": ("Время жизни ссылки (часы)", 1, 24 * 90, False),
+    "trash_retention_days": ("Хранение в корзине (дни)", 0, 365, False),
+    "camera_max_video_seconds": ("Макс. длина видео с камеры (сек)", 1, 600, False),
+    "stream_uploads": (
+        "Потоковая отдача файлов с Range (1=вкл, 0=выкл)", 0, 1, True),
+}
+
+
+@app.route("/admin/settings")
+@admin_required
+def admin_settings_page():
+    rows = []
+    for key, (label, lo, hi, is_flag) in EDITABLE_SETTINGS.items():
+        value = get_int_setting(key, None)
+        rows.append({
+            "key": key, "label": label, "min": lo, "max": hi,
+            "value": value if value is not None else lo,
+            "is_flag": is_flag,
+        })
+    return render_template("settings.html", rows=rows)
+
+
+@app.route("/admin/settings", methods=["POST"])
+@admin_required
+@limiter.limit("30 per minute")
+def admin_settings_save():
+    db = get_db()
+    changed = []
+    errors = []
+    for key, (label, lo, hi, _is_flag) in EDITABLE_SETTINGS.items():
+        raw = request.form.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            errors.append(f"{label}: не число")
+            continue
+        if not (lo <= value <= hi):
+            errors.append(f"{label}: значение вне диапазона {lo}–{hi}")
+            continue
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        changed.append(f"{key}={value}")
+    db.commit()
+    if changed:
+        audit("settings_changed", "; ".join(changed))
+    for err in errors:
+        flash(f"❌ {err}")
+    if changed and not errors:
+        flash("✅ Настройки сохранены")
+    elif not changed and not errors:
+        flash("ℹ️ Изменений не найдено")
+    return redirect(url_for("admin_settings_page"))
+
+
+# =====================================================================
+# 📜 АДМИН: ЖУРНАЛ СОБЫТИЙ
+# =====================================================================
+AUDIT_ACTIONS = [
+    "", "login_failed", "login", "logout", "password_changed",
+    "file_uploaded", "file_big_uploaded", "file_deleted", "file_restored",
+    "file_purged", "trash_purged", "share_created", "download",
+    "user_added", "user_deleted", "settings_changed", "backup_downloaded",
+    "ssh_cert_issued", "ssh_cert_revoked", "ssh_bundle_downloaded",
+    "quick_photo", "quick_video", "quick_screenshot",
+    "quick_media_deleted", "quick_media_purged", "power_action",
+]
+
+
+@app.route("/admin/log")
+@admin_required
+def admin_log_page():
+    q = request.args.get("q", "").strip()[:100]
+    action = request.args.get("action", "").strip()[:40]
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
+    per_page = 50
+
+    sql = "SELECT * FROM audit_log"
+    conds, params = [], []
+    if action in AUDIT_ACTIONS and action:
+        conds.append("action = ?")
+        params.append(action)
+    if q:
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds.append("(username LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\' OR ip LIKE ? ESCAPE '\\')")
+        like = f"%{escaped}%"
+        params += [like, like, like]
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+
+    total = get_db().execute(
+        "SELECT COUNT(*) FROM audit_log"
+        + (" WHERE " + " AND ".join(conds) if conds else ""),
+        params,
+    ).fetchone()[0]
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, pages)
+    rows = get_db().execute(
+        sql + " ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [per_page, (page - 1) * per_page],
+    ).fetchall()
+
+    return render_template(
+        "log.html", rows=rows, q=q, action=action,
+        page=page, pages=pages, total=total,
+        actions=[a for a in AUDIT_ACTIONS if a],
+    )
+
+
+@app.route("/admin/log/export")
+@admin_required
+def admin_log_export():
+    """Выгрузка журнала в CSV (для разбора инцидентов)."""
+    import csv
+    import io
+    rows = get_db().execute(
+        "SELECT created_at, username, action, details, ip "
+        "FROM audit_log ORDER BY id DESC LIMIT 10000"
+    ).fetchall()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["created_at", "username", "action", "details", "ip"])
+    for r in rows:
+        writer.writerow([r[0], r[1], r[2], r[3], r[4]])
+    data = buf.getvalue().encode("utf-8-sig")  # BOM для Excel
+    return Response(
+        data, mimetype="text/csv",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename*=UTF-8''{quote('audit_log.csv')}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.route("/admin/log/clear", methods=["POST"])
+@admin_required
+def admin_log_clear():
+    """Очистка журнала старше N дней (по умолчанию 90)."""
+    try:
+        days = max(0, int(request.form.get("days", 90)))
+    except ValueError:
+        days = 90
+    db = get_db()
+    if days == 0:
+        n = db.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+        db.execute("DELETE FROM audit_log")
+    else:
+        n = db.execute(
+            "SELECT COUNT(*) FROM audit_log "
+            "WHERE created_at < datetime('now', ?)",
+            (f"-{days} days",),
+        ).fetchone()[0]
+        db.execute(
+            "DELETE FROM audit_log WHERE created_at < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+    db.commit()
+    audit("log_cleared", f"удалено записей: {n} (старше {days} дн.)")
+    flash(f"🧹 Журнал очищен: удалено {n} записей")
+    return redirect(url_for("admin_log_page"))
 
 
 # =====================================================================
@@ -2120,7 +2499,7 @@ def quick_access_page():
         "quick.html",
         config=QUICK_ACCESS_CONFIG,
         media=media,
-        max_video_seconds=CAMERA_VIDEO_MAX_SECONDS,
+        max_video_seconds=effective_camera_max_video_seconds(),
         photo_ttl_hours=CAMERA_PHOTO_TTL // 3600,
         confirm_phrase=POWER_CONFIRM_PHRASE,
     )
@@ -2159,8 +2538,9 @@ def quick_capture_video():
         duration = int(request.form.get("duration", 10))
     except (TypeError, ValueError):
         duration = 0
-    if not (1 <= duration <= CAMERA_VIDEO_MAX_SECONDS):
-        flash(f"❌ Длительность: от 1 до {CAMERA_VIDEO_MAX_SECONDS} секунд")
+    max_seconds = effective_camera_max_video_seconds()
+    if not (1 <= duration <= max_seconds):
+        flash(f"❌ Длительность: от 1 до {max_seconds} секунд")
         return redirect(url_for("quick_access_page"))
 
     cleanup_media_files()
@@ -2196,7 +2576,7 @@ def quick_media_view(media_id):
     mimetype = {
         ".jpg": "image/jpeg", ".png": "image/png", ".mp4": "video/mp4",
     }.get(os.path.splitext(media_id)[1].lower())
-    resp = send_file(path, mimetype=mimetype, conditional=True)
+    resp = send_streamable(path, mimetype=mimetype, download_name=media_id)
     resp.headers["Cache-Control"] = "private, no-store"
     resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
     return resp

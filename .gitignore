@@ -1,1 +1,9 @@
-(empty)
+# Python
+__pycache__/
+*.pyc
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+goosko-online/deploy/goosko.env
