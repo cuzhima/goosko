@@ -460,11 +460,6 @@ def close_db(exception=None):
 
 init_db()
 
-# Фоновая автоочистка корзины/медиа/SSH-бандлов запускается только при
-# реальной работе сервера (не под pytest, чтобы не плодить потоки в тестах).
-if os.environ.get("GOOSKO_DISABLE_MAINTENANCE") != "1":
-    start_background_maintenance()
-
 
 # =====================================================================
 # ФИЛЬТРЫ И ВРЕМЯ
@@ -2499,4 +2494,8 @@ def check():
 
 
 if __name__ == "__main__":
+    # Фоновая автоочистка корзины/медиа/SSH-бандлов запускается только при
+    # реальной работе сервера (не под pytest/gunicorn, чтобы не плодить потоки).
+    if os.environ.get("GOOSKO_DISABLE_MAINTENANCE") != "1":
+        start_background_maintenance()
     app.run(host="127.0.0.1", port=5000)
