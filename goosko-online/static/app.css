@@ -384,3 +384,29 @@ tr:last-child td {
         align-items: flex-start;
     }
 }
+
+
+/* --- Быстрый доступ --- */
+.btn.warn {
+    background: #b45309;
+    color: #fff;
+    border-color: #b45309;
+}
+
+.btn.warn:hover {
+    filter: brightness(1.1);
+}
+
+.danger-card {
+    border: 1px solid var(--danger);
+}
+
+.danger-card .field,
+.danger-card input[type="text"] {
+    margin-bottom: 8px;
+}
+
+.media-thumb {
+    max-width: 220px;
+    border-radius: 10px;
+}

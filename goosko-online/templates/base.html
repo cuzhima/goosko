@@ -18,7 +18,10 @@
                     <a href="/">Панель</a>
                     <a href="/cloud">Облако</a>
                     <a href="/account">Аккаунт</a>
-		    <a href="/ssh">🔐 SSH</a>
+	                    {% if session.get('is_admin') %}
+	                    <a href="/quick">⚡ Быстрый доступ</a>
+	                    <a href="/ssh">🔐 SSH</a>
+	                    {% endif %}
                     <form method="post" action="{{ url_for('logout') }}" class="inline-form">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button class="btn small" type="submit">Выйти</button>

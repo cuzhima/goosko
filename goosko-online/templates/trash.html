@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block title %}Корзина | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>🗑️ Корзина</h1>
+<p class="muted">
+    Удалённые файлы хранятся здесь {{ retention_days }} дн., затем удаляются навсегда.
+</p>
+
+{% if files %}
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th>Файл</th>
+                <th>Владелец</th>
+                <th>Зона</th>
+                <th>Размер</th>
+                <th>Удалён</th>
+                <th>Осталось</th>
+                <th>Действия</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for f in files %}
+            <tr>
+                <td><code>{{ f.name }}</code></td>
+                <td>{{ f.owner }}</td>
+                <td>{{ 'Публичная' if f.zone == 'public' else 'Приватная' }}</td>
+                <td>{{ f.size | human_size }}</td>
+                <td>{{ f.deleted_at }}</td>
+                <td>{% if f.remaining_days is not none %}{{ f.remaining_days }} дн.{% endif %}</td>
+                <td class="file-actions">
+                    <form method="post" action="{{ url_for('cloud_restore', file_id=f.id) }}" class="inline-form">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button class="btn small primary" type="submit">♻️ Восстановить</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+{% if session.get('is_admin') %}
+<form method="post" action="{{ url_for('cloud_purge_trash') }}" class="inline-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn danger" type="submit">🧹 Очистить корзину безвозвратно</button>
+</form>
+{% endif %}
+{% else %}
+<p class="muted">Корзина пуста 🎉</p>
+{% endif %}
+
+<p><a href="{{ url_for('cloud') }}">← Вернуться в облако</a></p>
+{% endblock %}

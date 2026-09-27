@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+
+{% block title %}Быстрый доступ | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>⚡ Быстрый доступ</h1>
+<p class="muted">
+    Съёмка с веб-камеры (<code>{{ config.video_device }}</code>, {{ config.resolution }}),
+    скриншоты экрана сервера и управление питанием.
+    Медиафайлы хранятся на сервере и автоматически удаляются через {{ photo_ttl_hours }} ч.
+</p>
+
+<div class="grid two">
+    <div class="card">
+        <h2>📷 Фото с камеры</h2>
+        <p>Один кадр с веб-камеры сервера.</p>
+        <form method="post" action="{{ url_for('quick_capture_photo') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn primary" type="submit">📸 Сделать фото</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>🎥 Видео с камеры</h2>
+        <form method="post" action="{{ url_for('quick_capture_video') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <label class="field">
+                Длительность (секунды, 1–{{ max_video_seconds }})
+                <input type="number" name="duration" value="10" min="1" max="{{ max_video_seconds }}" required>
+            </label>
+            <button class="btn primary" type="submit">🎬 Записать видео</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>🖥️ Скриншот экрана</h2>
+        <p>Снимок рабочего стола сервера (<code>{{ config.screen_device }}</code>).</p>
+        <form method="post" action="{{ url_for('quick_capture_screenshot') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn primary" type="submit">🖼️ Сделать скриншот</button>
+        </form>
+    </div>
+
+    <div class="card danger-card">
+        <h2>🔌 Питание сервера</h2>
+        <p class="muted">Опасные действия. Для выполнения введите фразу
+            <code>{{ confirm_phrase }}</code> — это защита от случайного нажатия.</p>
+
+        <form method="post" action="{{ url_for('quick_power', action='reboot') }}"
+              data-confirm-power="{{ confirm_phrase }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input class="field" type="text" name="confirm" placeholder="Введите: {{ confirm_phrase }}" autocomplete="off" required>
+            <button class="btn warn" type="submit">♻️ Перезагрузить</button>
+        </form>
+
+        <form method="post" action="{{ url_for('quick_power', action='shutdown') }}"
+              data-confirm-power="{{ confirm_phrase }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input class="field" type="text" name="confirm" placeholder="Введите: {{ confirm_phrase }}" autocomplete="off" required>
+            <button class="btn danger" type="submit">🛑 Выключить сервер</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <h2>🗂️ Отснятые материалы</h2>
+
+    {% if media %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Тип</th>
+                    <th>Файл</th>
+                    <th>Размер</th>
+                    <th>Создан</th>
+                    <th>Действия</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for m in media %}
+                <tr>
+                    <td>{{ m.kind }}</td>
+                    <td><code>{{ m.id }}</code></td>
+                    <td>{{ m.size | human_size }}</td>
+                    <td>{{ m.mtime }}</td>
+                    <td class="file-actions">
+                        <a class="btn small" href="{{ url_for('quick_media_view', media_id=m.id) }}" target="_blank" rel="noopener">Открыть</a>
+                        <form method="post" action="{{ url_for('quick_delete_media') }}" class="inline-form">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <input type="hidden" name="id" value="{{ m.id }}">
+                            <button class="btn small danger" type="submit">Удалить</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <form method="post" action="{{ url_for('quick_purge_media') }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn danger" type="submit">🧹 Очистить всё</button>
+    </form>
+    {% else %}
+    <p class="muted">Пока пусто — сделайте фото, видео или скриншот.</p>
+    {% endif %}
+</div>
+{% endblock %}
