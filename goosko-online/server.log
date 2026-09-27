@@ -1,0 +1,28 @@
+nohup: ignoring input
+ * Serving Flask app 'app'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://127.0.0.1:5000
+Press CTRL+C to quit
+127.0.0.1 - - [27/Sep/2026 10:55:49] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:55:49] "GET /login HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:55:49] "GET /cloud HTTP/1.1" 302 -
+127.0.0.1 - - [27/Sep/2026 10:55:49] "GET /admin/settings HTTP/1.1" 302 -
+127.0.0.1 - - [27/Sep/2026 10:55:49] "GET /quick HTTP/1.1" 302 -
+127.0.0.1 - - [27/Sep/2026 10:55:49] "GET /share/xxx HTTP/1.1" 404 -
+127.0.0.1 - - [27/Sep/2026 10:58:11] "GET /login HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:31] "GET /login HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:31] "POST /login HTTP/1.1" 302 -
+127.0.0.1 - - [27/Sep/2026 10:58:36] "GET /login HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:36] "POST /login HTTP/1.1" 302 -
+127.0.0.1 - - [27/Sep/2026 10:58:45] "GET /login HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:45] "POST /login HTTP/1.1" 302 -
+127.0.0.1 - - [27/Sep/2026 10:58:45] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:45] "GET /cloud HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:45] "GET /admin/settings HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:46] "GET /admin/log HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:46] "GET /quick HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:46] "GET /account HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 10:58:46] "GET /cloud/trash HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 11:03:00] "GET /login HTTP/1.1" 200 -
+127.0.0.1 - - [27/Sep/2026 11:03:09] "GET /login HTTP/1.1" 200 -
