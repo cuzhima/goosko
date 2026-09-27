@@ -130,3 +130,23 @@ document.addEventListener("DOMContentLoaded", () => {
         });
     });
 });
+
+
+// --- Быстрый доступ: подтверждение опасных действий питанием ---
+document.addEventListener("submit", (event) => {
+    const form = event.target.closest("form[data-confirm-power]");
+    if (!form) return;
+
+    const phrase = form.dataset.confirmPower || "";
+    const value = (form.querySelector("input[name=confirm]")?.value || "").trim();
+
+    if (value !== phrase) {
+        event.preventDefault();
+        alert("Введите точную фразу подтверждения: " + phrase);
+        return;
+    }
+
+    if (!confirm("Точно выполнить это действие? Сервер может стать недоступен.")) {
+        event.preventDefault();
+    }
+});

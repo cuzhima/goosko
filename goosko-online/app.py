@@ -21,8 +21,14 @@ import hmac
 import time
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import quote
 
 
@@ -74,6 +80,10 @@ USE_X_ACCEL = os.environ.get("USE_X_ACCEL", "1") == "1"
 
 DB = os.environ.get("DB_PATH", "users.db")
 
+# В dev-режиме (STORAGE_DIR не задан) считаем, что это локальная разработка:
+# ослабляем cookie-требования и не включаем строгий HSTS.
+IS_DEV = os.environ.get("STORAGE_DIR") is None
+
 
 # =====================================================================
 # FLASK APP
@@ -87,7 +97,7 @@ if not SECRET_KEY:
 app.secret_key = SECRET_KEY
 
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_SECURE=not IS_DEV,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
@@ -95,6 +105,8 @@ app.config.update(
     WTF_CSRF_TIME_LIMIT=3600,
     WTF_CSRF_SSL_STRICT=False,
     PREFERRED_URL_SCHEME="https",
+    # Усиленное хеширование паролей (scrypt вместо слабых по умолчанию pbkdf2/hex)
+    PW_HASH_METHOD="scrypt",
 )
 
 # Поддержка Cloudflare и Tailscale Funnel
@@ -103,7 +115,18 @@ app.wsgi_app = ProxyFix(
 )
 
 csrf = CSRFProtect(app)
-limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
+
+# Ограничение частоты запросов. Ключ — реальный IP клиента (с учётом
+# Cloudflare/Tailscale через ProxyFix), а не адрес прокси.
+def client_key():
+    return get_remote_address() or "unknown"
+
+limiter = Limiter(
+    key_func=client_key,
+    app=app,
+    default_limits=["200 per hour", "30 per minute"],
+    storage_uri="memory://",
+)
 
 
 # =====================================================================
@@ -111,11 +134,17 @@ limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
 # =====================================================================
 @app.before_request
 def set_dynamic_cookie_domain():
-    host = request.host.split(":")[0]
+    host = (request.host or "").split(":")[0].lower()
     if host == "goosko.online" or host.endswith(".goosko.online"):
         app.config["SESSION_COOKIE_DOMAIN"] = ".goosko.online"
     elif host.endswith(".ts.net"):
-        app.config["SESSION_COOKIE_DOMAIN"] = host
+        # Точный allow-list нашего Funnel-хоста: нельзя ставить cookie-domain
+        # из заголовка Host, который контролирует атакующий.
+        funnel_host = FUNNEL_HOST.split("://")[-1].split("/")[0].lower()
+        if host == funnel_host or host.endswith("." + funnel_host):
+            app.config["SESSION_COOKIE_DOMAIN"] = host
+        else:
+            app.config["SESSION_COOKIE_DOMAIN"] = None
     else:
         app.config["SESSION_COOKIE_DOMAIN"] = None
 
@@ -141,10 +170,30 @@ UNSAFE_PUBLIC_EXTENSIONS = {
     ".ps1", ".dll", ".exe", ".msi", ".htaccess",
 }
 
+# Расширения, которые отдаём в браузере как есть (просмотр).
+INLINE_SAFE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".bmp", ".ico",
+    ".tif", ".tiff", ".heic", ".heif",
+    ".pdf", ".txt", ".md", ".csv", ".log", ".json",
+    ".mp3", ".ogg", ".wav", ".flac", ".m4a",
+    ".mp4", ".webm", ".mov", ".m4v",
+}
+
 
 def is_safe_public_filename(filename):
     ext = os.path.splitext(filename)[1].lower()
     return ext not in UNSAFE_PUBLIC_EXTENSIONS
+
+
+def is_inline_safe(filename):
+    """Файл можно показывать в браузере инлайнно (с изоляцией по домену)."""
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in INLINE_SAFE_EXTENSIONS and not is_hidden_dotfile(filename)
+
+
+def is_hidden_dotfile(filename):
+    base = os.path.basename(filename)
+    return base.startswith(".")
 
 
 # =====================================================================
@@ -205,6 +254,13 @@ def init_db():
             revoked_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_files_share ON files(share_token);
+        CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active
             ON files(zone, rel_path) WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner);
@@ -233,8 +289,55 @@ def init_db():
             print("Смени его сразу после входа!")
             print("=" * 80)
 
+    # Настройки по умолчанию
+    defaults = {
+        "trash_retention_days": str(int(os.environ.get("TRASH_RETENTION_DAYS", 30))),
+        "user_quota_bytes": str(USER_QUOTA),
+        "max_file_size_bytes": str(MAX_FILE_SIZE),
+        "share_ttl_hours": str(SHARE_TTL_HOURS),
+    }
+    for key, value in defaults.items():
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+        except sqlite3.Error:
+            pass
+
     conn.commit()
     conn.close()
+
+
+def get_setting(key, default=None):
+    row = get_db().execute(
+        "SELECT value FROM settings WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else default
+
+
+def get_int_setting(key, default):
+    try:
+        return int(get_setting(key))
+    except (TypeError, ValueError):
+        return default
+
+
+def effective_user_quota():
+    """Квота пользователя (админы — без ограничений)."""
+    return get_int_setting("user_quota_bytes", USER_QUOTA)
+
+
+def effective_max_file_size():
+    return get_int_setting("max_file_size_bytes", MAX_FILE_SIZE)
+
+
+def effective_share_ttl_hours():
+    return get_int_setting("share_ttl_hours", SHARE_TTL_HOURS)
+
+
+def effective_trash_retention_days():
+    return max(0, get_int_setting("trash_retention_days", 30))
 
 
 def get_db():
@@ -329,7 +432,9 @@ def login_required(f):
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
         if "user" not in session:
-            return redirect(url_for("index"))
+            # Запоминаем, куда хотел пойти пользователь (только внутренние пути)
+            next_url = sanitize_next(request.full_path.rstrip("?"))
+            return redirect(url_for("index", next=next_url) if next_url else url_for("index"))
         return f(*args, **kwargs)
     return wrapped
 
@@ -390,7 +495,86 @@ def get_user_usage(username):
 def quota_remaining(username):
     if is_admin_username(username):
         return None
-    return max(0, USER_QUOTA - get_user_usage(username))
+    return max(0, effective_user_quota() - get_user_usage(username))
+
+
+# =====================================================================
+# КОРЗИНА: ВОССТАНОВЛЕНИЕ / ОЧИСТКА
+# =====================================================================
+def get_trash_file_by_id(file_id):
+    return get_db().execute(
+        "SELECT * FROM files WHERE id=? AND deleted_at IS NOT NULL", (file_id,)
+    ).fetchone()
+
+
+def resolve_trash_path(row):
+    """Безопасно собираем физический путь файла в корзине."""
+    name = os.path.basename(row["trash_path"] or "")
+    if not name:
+        return None
+    path = safe_join(TRASH_DIR, name)
+    if path is None:
+        return None
+    base_real = os.path.realpath(TRASH_DIR)
+    path_real = os.path.realpath(path)
+    if not path_real.startswith(base_real + os.sep):
+        return None
+    return path
+
+
+def purge_trash_files(max_age_days=None):
+    """Удаляет файлы из корзины старше max_age_days. Возвращает число."""
+    if max_age_days is None:
+        max_age_days = effective_trash_retention_days()
+    db = get_db()
+    rows = db.execute(
+        "SELECT * FROM files WHERE deleted_at IS NOT NULL"
+    ).fetchall()
+    cutoff = utcnow() - timedelta(days=max_age_days)
+    purged = 0
+    for row in rows:
+        deleted = parse_db_dt(row["deleted_at"])
+        if not deleted or deleted > cutoff:
+            continue
+        path = resolve_trash_path(row)
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                app.logger.exception("Failed to purge %s", path)
+                continue
+        db.execute("DELETE FROM files WHERE id=?", (row["id"],))
+        purged += 1
+    if purged:
+        db.commit()
+    return purged
+
+
+def start_background_maintenance():
+    """Раз в сутки: чистим корзину, устаревшие медиа и SSH-бандлы."""
+    def worker():
+        while True:
+            time.sleep(24 * 3600)
+            try:
+                with app.app_context():
+                    n = purge_trash_files()
+                    if n:
+                        app.logger.info("Trash cleanup: purged %d old files", n)
+            except Exception:
+                app.logger.exception("Background trash cleanup failed")
+            try:
+                m = cleanup_media_files()
+                if m:
+                    app.logger.info("Media cleanup: removed %d files", m)
+            except Exception:
+                app.logger.exception("Background media cleanup failed")
+            try:
+                ssh_bundles_cleanup()
+            except Exception:
+                app.logger.exception("SSH bundles cleanup failed")
+
+    t = threading.Thread(target=worker, daemon=True, name="goosko-maintenance")
+    t.start()
 
 
 # =====================================================================
@@ -545,16 +729,92 @@ def list_files(zone=None, owner=None, private_username=None, q=None):
         sql += " AND owner = ?"
         params.append(owner)
     if private_username:
-        sql += " AND zone = 'private' AND rel_path LIKE ?"
-        params.append(private_username + "/%")
+        sql += " AND zone = 'private' AND rel_path LIKE ? ESCAPE '\\'"
+        like_prefix = private_username.replace("\\", "\\\\").replace(
+            "%", "\\%").replace("_", "\\_") + "/%"
+        params.append(like_prefix)
     if q:
-        sql += " AND (original_name LIKE ? OR rel_path LIKE ?)"
-        like = f"%{q}%"
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        sql += (
+            " AND (original_name LIKE ? ESCAPE '\\' OR rel_path LIKE ? ESCAPE '\\')"
+        )
+        like = f"%{escaped}%"
         params.extend([like, like])
 
     sql += " ORDER BY created_at DESC LIMIT 1000"
     rows = db.execute(sql, params).fetchall()
     return [file_to_dict(r) for r in rows]
+
+
+def list_trash(username=None, is_admin=False):
+    """Список файлов в корзине (своих или всех для админа)."""
+    db = get_db()
+    sql = "SELECT * FROM files WHERE deleted_at IS NOT NULL"
+    params = []
+    if not is_admin:
+        sql += " AND owner = ?"
+        params.append(username)
+    sql += " ORDER BY deleted_at DESC LIMIT 500"
+    out = []
+    for row in db.execute(sql, params).fetchall():
+        deleted = parse_db_dt(row["deleted_at"])
+        remaining_days = None
+        if deleted:
+            retention = effective_trash_retention_days()
+            expires = deleted + timedelta(days=retention)
+            remaining_days = max(0, (expires - utcnow()).days)
+        out.append({
+            "id": row["id"],
+            "owner": row["owner"],
+            "zone": row["zone"],
+            "name": os.path.basename(row["rel_path"]),
+            "path": row["rel_path"],
+            "size": row["size"] or 0,
+            "deleted_at": row["deleted_at"] or "",
+            "remaining_days": remaining_days,
+            "can_delete": bool(is_admin or row["owner"] == session.get("user")),
+        })
+    return out
+
+
+def restore_file_from_trash(row):
+    """Возвращает файл из корзины на исходное место (или под новым именем)."""
+    trash_path = resolve_trash_path(row)
+    if not trash_path or not os.path.isfile(trash_path):
+        return False, "Физический файл в корзине не найден"
+
+    base_dir = PRIVATE_DIR if row["zone"] == "private" else PUBLIC_DIR
+    prefix = ""
+    rel = row["rel_path"]
+    if row["zone"] == "private":
+        parts = rel.split("/", 1)
+        prefix = parts[0]
+    filename = os.path.basename(rel)
+
+    # Если на месте уже другой файл — сохраняем под новым именем
+    target_rel = rel
+    if active_file_exists(row["zone"], rel) or \
+            os.path.exists(resolve_storage_path(base_dir, rel) or ""):
+        target_rel = unique_rel_path(base_dir, prefix, filename, row["zone"])
+
+    target_path = resolve_storage_path(base_dir, target_rel)
+    if target_path is None:
+        return False, "Некорректный путь восстановления"
+
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    shutil.move(trash_path, target_path)
+    try:
+        os.chmod(target_path, 0o640)
+    except OSError:
+        pass
+
+    db = get_db()
+    db.execute(
+        "UPDATE files SET deleted_at=NULL, trash_path=NULL, rel_path=? WHERE id=?",
+        (target_rel, row["id"]),
+    )
+    db.commit()
+    return True, target_rel
 
 
 def public_url(rel_path):
@@ -654,6 +914,170 @@ def check_upload_token(token):
 
 
 # =====================================================================
+# ⚡ БЫСТРЫЙ ДОСТУП: КАМЕРА / СКРИНШОТЫ / ПИТАНИЕ СЕРВЕРА
+# =====================================================================
+MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", os.path.join(STORAGE_DIR, "media")))
+ensure_dir(str(MEDIA_DIR))
+
+CAMERA_PHOTO_TTL = int(os.environ.get("CAMERA_PHOTO_TTL", 24 * 3600))    # 1 сутки
+CAMERA_VIDEO_MAX_SECONDS = int(os.environ.get("CAMERA_VIDEO_MAX_SECONDS", 120))
+
+
+@dataclass(frozen=True)
+class Config:
+    """Конфигурация быстрого доступа (значения из окружения)."""
+    video_device: str
+    resolution: str
+    screen_device: str
+    wayland_display: str
+    ffmpeg_timeout: int
+
+
+QUICK_ACCESS_CONFIG = Config(
+    video_device=os.environ.get("CAMERA_DEVICE", "/dev/video0"),
+    resolution=os.environ.get("CAMERA_RESOLUTION", "1280x720"),
+    screen_device=os.environ.get("SCREEN_DEVICE", ":1.0+0,0"),
+    wayland_display=os.environ.get("WAYLAND_DISPLAY_ENV", "wayland-0"),
+    ffmpeg_timeout=int(os.environ.get("FFMPEG_TIMEOUT", 30)),
+)
+
+
+def run_cmd(cmd, timeout=30, env=None):
+    """Запуск команды без shell (списком аргументов). -> (ok, stdout, stderr)"""
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        return proc.returncode == 0, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        return False, "", f"Не найдена программа: {cmd[0]}"
+    except subprocess.TimeoutExpired:
+        return False, "", f"Превышен таймаут ({timeout} с): {' '.join(cmd[:3])}…"
+    except Exception as exc:  # защита от любых ошибок запуска
+        app.logger.exception("run_cmd failed")
+        return False, "", str(exc)
+
+
+def quick_access_env():
+    """Окружение для grab/wl-clipboard-scrcpy (нужен доступ к сессии Wayland)."""
+    env = os.environ.copy()
+    env.setdefault("WAYLAND_DISPLAY", QUICK_ACCESS_CONFIG.wayland_display)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("DBUS_SESSION_BUS_ADDRESS",
+                   f"unix:path={env['XDG_RUNTIME_DIR']}/bus")
+    return env
+
+
+def capture_photo(config: Config) -> tuple[bool, str]:
+    """Делает фото с веб-камеры."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = MEDIA_DIR / f"cam_photo_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
+
+    ok, _, err = run_cmd([
+        "ffmpeg", "-y",
+        "-f", "v4l2", "-video_size", config.resolution,
+        "-i", config.video_device,
+        "-vframes", "1",
+        "-ss", "00:00:02",
+        str(filepath)
+    ], timeout=config.ffmpeg_timeout)
+
+    if not ok or not filepath.exists():
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except OSError:
+                pass
+        return False, err.strip() or "Ошибка ffmpeg"
+    return True, str(filepath)
+
+
+def capture_video(config: Config, duration: int) -> tuple[bool, str]:
+    """Записывает видео с веб-камеры."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = MEDIA_DIR / f"cam_video_{timestamp}_{uuid.uuid4().hex[:8]}.mp4"
+
+    ok, _, err = run_cmd([
+        "ffmpeg", "-y",
+        "-f", "v4l2", "-video_size", config.resolution,
+        "-i", config.video_device,
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        str(filepath)
+    ], timeout=config.ffmpeg_timeout + duration + 10)
+
+    if not ok or not filepath.exists():
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except OSError:
+                pass
+        return False, err.strip() or "Ошибка ffmpeg"
+    return True, str(filepath)
+
+
+def capture_screenshot(config: Config) -> tuple[bool, str]:
+    """Делает скриншот экрана сервера (grab — для X11/Wayland через PipeWire)."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = MEDIA_DIR / f"screenshot_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+
+    ok, _, err = run_cmd(
+        ["grab", "--filename", str(filepath), config.screen_device],
+        timeout=config.ffmpeg_timeout, env=quick_access_env(),
+    )
+    if not ok or not filepath.exists():
+        if filepath.exists():
+            try:
+                filepath.unlink()
+            except OSError:
+                pass
+        return False, err.strip() or "grab не установлен или экран недоступен"
+    return True, str(filepath)
+
+
+MEDIA_ID_RE = re.compile(r"^(cam_photo|cam_video|screenshot)_\d{8}_\d{6}_[0-9a-f]{8}\.(jpg|mp4|png)$")
+
+
+def resolve_media_file(media_id):
+    """Строго по белому списку имён находим файл медиа (защита от path traversal)."""
+    if not MEDIA_ID_RE.fullmatch(media_id or ""):
+        return None
+    path = MEDIA_DIR / media_id
+    if not path.is_file():
+        return None
+    return str(path)
+
+
+def cleanup_media_files(max_age_hours=CAMERA_PHOTO_TTL // 3600):
+    """Удаляет устаревшие медиа быстрой съёмки. Возвращает число удалённых."""
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    try:
+        for p in MEDIA_DIR.iterdir():
+            if not MEDIA_ID_RE.fullmatch(p.name):
+                continue
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                app.logger.exception("Failed to purge media %s", p)
+    except OSError:
+        pass
+    return removed
+
+
+POWER_ACTIONS = {
+    "shutdown": (["sudo", "-n", "/usr/local/bin/goosko-power.sh", "poweroff"],
+                 "Сервер выключается 🛑"),
+    "reboot":   (["sudo", "-n", "/usr/local/bin/goosko-power.sh", "reboot"],
+                 "Сервер перезагрушивается ♻️"),
+}
+POWER_CONFIRM_PHRASE = "Я УВЕРЕН"
+
+
+# =====================================================================
 # 🔐 SSH-СЕРТИФИКАТЫ
 # =====================================================================
 SSH_PRINCIPAL = os.environ.get("SSH_PRINCIPAL", "andrey")
@@ -664,7 +1088,45 @@ SSH_PORT = int(os.environ.get("SSH_PORT", "10000"))
 SSH_SIGNER = "/usr/local/bin/goosko-ssh-sign.sh"
 SSH_REVOKER = "/usr/local/bin/goosko-ssh-revoke.sh"
 SSH_MIN_TTL, SSH_MAX_TTL = 5, 1440
-SSH_BUNDLES = {}
+
+# Бандлы приватных ключей: не храним их в памяти вечно.
+# Потокобезопасный LRU с ограничением по количеству и времени жизни.
+SSH_BUNDLE_TTL = 600          # 10 минут на скачивание
+SSH_BUNDLE_MAX = 200          # максимум бандлов в памяти
+SSH_BUNDLES = OrderedDict()
+SSH_BUNDLES_LOCK = threading.Lock()
+
+
+def ssh_bundles_put(token, priv, cert):
+    with SSH_BUNDLES_LOCK:
+        now = time.time()
+        # выбрасываем протухшие
+        expired = [k for k, v in SSH_BUNDLES.items() if now > v["expires"]]
+        for k in expired:
+            SSH_BUNDLES.pop(k, None)
+        # ограничиваем размер
+        while len(SSH_BUNDLES) >= SSH_BUNDLE_MAX:
+            SSH_BUNDLES.popitem(last=False)
+        SSH_BUNDLES[token] = {
+            "priv": priv, "cert": cert, "expires": now + SSH_BUNDLE_TTL,
+        }
+
+
+def ssh_bundles_get(token):
+    with SSH_BUNDLES_LOCK:
+        b = SSH_BUNDLES.get(token)
+        if not b or time.time() > b["expires"]:
+            if b:
+                SSH_BUNDLES.pop(token, None)
+            return None
+        return b
+
+
+def ssh_bundles_cleanup():
+    with SSH_BUNDLES_LOCK:
+        now = time.time()
+        for k in [k for k, v in SSH_BUNDLES.items() if now > v["expires"]]:
+            SSH_BUNDLES.pop(k, None)
 
 
 def ssh_sign(pubkey_text, ttl_minutes, identity):
@@ -702,22 +1164,31 @@ def ssh_revoke_cert(cert_text):
 # =====================================================================
 @app.after_request
 def security_headers(response):
-    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), display-capture=()"
+    )
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
 
-    if request.is_secure:
+    if request.is_secure and not IS_DEV:
         response.headers["Strict-Transport-Security"] = (
             "max-age=31536000; includeSubDomains; preload"
         )
 
+    # Запрещаем браузерам гадать о типе содержимого и встраивать нас во фреймы.
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self'; "
         "img-src 'self' data:; object-src 'none'; "
-        "base-uri 'none'; frame-ancestors 'none'; connect-src 'self'"
+        "base-uri 'none'; frame-ancestors 'none'; connect-src 'self'; "
+        "form-action 'self'; frame-src 'none'"
     )
+
+    # Файлы из хранилища не должны кэшироваться общими кэшами в приватной зоне.
+    if request.path.startswith("/private/"):
+        response.headers["Cache-Control"] = "private, no-store"
+
     return response
 
 
@@ -857,30 +1328,119 @@ def index():
             ]
             return render_template("admin.html", users=users)
         return render_template("user.html", user=session["user"])
-    return render_template("login.html")
+    # Гость: показываем форму входа с сохранением цели перехода
+    next_url = sanitize_next(request.args.get("next"))
+    return render_template("login.html", next_url=next_url or "")
 
 
 # =====================================================================
 # ВХОД / ВЫХОД
 # =====================================================================
+# Фиктивные хеши: проверка всегда выполняется, даже если пользователя нет
+# (защита от перечисления имён по времени ответа).
+DUMMY_HASH = generate_password_hash(secrets.token_urlsafe(32))
+
+# Неудачные попытки входа: {ключ: [метки времени]}
+_login_failures = {}
+_login_failures_lock = threading.Lock()
+
+
+def login_lock_key(username):
+    return f"login:{(request.remote_addr or '?')}|{username.lower()}"
+
+
+LOGIN_LOCK_WINDOW = 900       # окно наблюдения — 15 минут
+LOGIN_LOCK_MAX_FAILURES = 10  # после этого блокируем
+
+
+def login_is_locked(username):
+    key = login_lock_key(username)
+    with _login_failures_lock:
+        failures = _login_failures.get(key)
+        if not failures:
+            return False
+        recent = [t for t in failures if time.time() - t < LOGIN_LOCK_WINDOW]
+        if recent:
+            _login_failures[key] = recent
+        else:
+            _login_failures.pop(key, None)
+        return len(recent) >= LOGIN_LOCK_MAX_FAILURES
+
+
+def login_record_failure(username):
+    key = login_lock_key(username)
+    with _login_failures_lock:
+        _login_failures.setdefault(key, []).append(time.time())
+        # не даём словарю расти бесконечно
+        if len(_login_failures) > 10000:
+            cutoff = time.time() - LOGIN_LOCK_WINDOW
+            for k in list(_login_failures):
+                v = [t for t in _login_failures[k] if t >= cutoff]
+                if v:
+                    _login_failures[k] = v
+                else:
+                    _login_failures.pop(k, None)
+
+
 @app.route("/login", methods=["POST"])
 @limiter.limit("10 per minute")
 def login():
     username = request.form.get("u", "").strip()
     password = request.form.get("p", "")
+
+    if login_is_locked(username):
+        audit("login_locked", username)
+        flash("❌ Слишком много неудачных попыток. Подожди 15 минут.")
+        return redirect("/")
+
     row = get_db().execute(
         "SELECT * FROM users WHERE username = ?", (username,)
     ).fetchone()
-    if row and check_password_hash(row["password"], password):
+
+    # Защита от тайминг-атак и перечисления пользователей:
+    # всегда выполняем проверку хеша, даже если пользователя нет.
+    hash_to_check = row["password"] if row else DUMMY_HASH
+    password_ok = check_password_hash(hash_to_check, password)
+
+    if row and password_ok:
         session.clear()
         session["user"] = row["username"]
         session["is_admin"] = bool(row["is_admin"])
         session.permanent = True
+        with _login_failures_lock:
+            _login_failures.pop(login_lock_key(username), None)
         audit("login_success", username)
-        return redirect("/")
+
+        # Прозрачная миграция слабых хешей на scrypt
+        if not row["password"].startswith("scrypt"):
+            db = get_db()
+            db.execute(
+                "UPDATE users SET password = ? WHERE id = ?",
+                (generate_password_hash(password), row["id"]),
+            )
+            db.commit()
+
+        # Куда возвращаем пользователя?
+        next_url = sanitize_next(request.form.get("next"))
+        if not next_url:
+            next_url = "/"
+        return redirect(next_url)
+
+    login_record_failure(username)
     audit("login_failed", username)
     flash("Неверный логин или пароль")
     return redirect("/")
+
+
+def sanitize_next(url):
+    """Разрешаем только внутренние относительные пути (защита от open redirect)."""
+    if not url:
+        return None
+    if url.startswith("//") or not url.startswith("/"):
+        return None
+    if any(c in url for c in ("\r", "\n", "\\")):
+        return None
+    return url
 
 
 @app.route("/logout", methods=["POST"])
@@ -899,16 +1459,20 @@ def logout():
 @login_required
 def account():
     usage = get_user_usage(session["user"])
+    quota = effective_user_quota()
     if session.get("is_admin"):
         percent = 100
     else:
-        percent = min(100, int((usage / USER_QUOTA) * 100)) if USER_QUOTA else 100
-    return render_template("account.html", usage=usage, percent=percent)
+        percent = min(100, int((usage / quota) * 100)) if quota else 100
+    return render_template(
+        "account.html", usage=usage, percent=percent, user_quota=quota,
+    )
 
 
 @app.route("/account/change-password", methods=["POST"])
 @login_required
-def change_password():
+@limiter.limit("10 per hour")
+def account_change_password():
     current_password = request.form.get("current", "")
     new_password = request.form.get("new", "")
     confirm_password = request.form.get("confirm", "")
@@ -918,6 +1482,7 @@ def change_password():
         "SELECT password FROM users WHERE username = ?", (session["user"],)
     ).fetchone()
     if not row or not check_password_hash(row["password"], current_password):
+        audit("password_change_failed", session["user"])
         flash("❌ Текущий пароль неверный")
         return redirect(url_for("account"))
 
@@ -928,6 +1493,10 @@ def change_password():
 
     if new_password != confirm_password:
         flash("❌ Пароли не совпадают")
+        return redirect(url_for("account"))
+
+    if new_password == current_password:
+        flash("❌ Новый пароль совпадает с текущим")
         return redirect(url_for("account"))
 
     db.execute(
@@ -947,7 +1516,7 @@ def change_password():
 @app.route("/cloud")
 @login_required
 def cloud():
-    q = request.args.get("q", "").strip()
+    q = request.args.get("q", "").strip()[:200]
     username = session["user"]
     is_admin = session.get("is_admin", False)
 
@@ -963,17 +1532,62 @@ def cloud():
         users = [r["username"] for r in rows]
 
     usage = get_user_usage(username)
+    quota = effective_user_quota()
     if is_admin:
         quota_percent = 100
     else:
-        quota_percent = min(100, int((usage / USER_QUOTA) * 100)) if USER_QUOTA else 100
+        quota_percent = min(100, int((usage / quota) * 100)) if quota else 100
 
     return render_template(
         "cloud.html",
         public_files=public_files,
         private_files=private_files,
         users=users, q=q, usage=usage, quota_percent=quota_percent,
+        user_quota=quota,
+        max_file_size=effective_max_file_size(),
     )
+
+
+# =====================================================================
+# ОБЛАКО: КОРЗИНА
+# =====================================================================
+@app.route("/cloud/trash")
+@login_required
+def cloud_trash():
+    is_admin = session.get("is_admin", False)
+    files = list_trash(username=session["user"], is_admin=is_admin)
+    return render_template(
+        "trash.html", files=files,
+        retention_days=effective_trash_retention_days(),
+    )
+
+
+@app.route("/cloud/restore/<int:file_id>", methods=["POST"])
+@login_required
+def cloud_restore(file_id):
+    row = get_trash_file_by_id(file_id)
+    if not row:
+        flash("❌ Файл в корзине не найден")
+        return redirect(url_for("cloud_trash"))
+    if not (session.get("is_admin") or row["owner"] == session["user"]):
+        flash("❌ Доступ запрещён")
+        return redirect(url_for("cloud_trash"))
+    ok, info = restore_file_from_trash(row)
+    if ok:
+        audit("restore", info)
+        flash(f"♻️ Файл восстановлен: {os.path.basename(info)}")
+    else:
+        flash(f"❌ Не удалось восстановить файл: {info}")
+    return redirect(url_for("cloud_trash"))
+
+
+@app.route("/cloud/purge-trash", methods=["POST"])
+@admin_required
+def cloud_purge_trash():
+    n = purge_trash_files()
+    audit("trash_purged", f"{n} files")
+    flash(f"🧹 Из корзины удалено файлов: {n}")
+    return redirect(url_for("cloud_trash"))
 
 
 # =====================================================================
@@ -991,8 +1605,8 @@ def cloud_upload():
         flash("Файл не выбран")
         return redirect(url_for("cloud"))
 
-    if request.content_length and request.content_length > MAX_FILE_SIZE:
-        flash(f"❌ Файл слишком большой (максимум {MAX_FILE_SIZE // (1024*1024)} МБ)")
+    if request.content_length and request.content_length > effective_max_file_size():
+        flash(f"❌ Файл слишком большой (максимум {human_size(effective_max_file_size())})")
         return redirect(url_for("cloud"))
 
     zone = request.form.get("zone", "private")
@@ -1058,10 +1672,10 @@ def cloud_upload():
     try:
         size = save_upload_stream(
             file.stream, target_path,
-            max_size=MAX_FILE_SIZE, quota_remaining=remaining,
+            max_size=effective_max_file_size(), quota_remaining=remaining,
         )
     except UploadTooLarge:
-        flash(f"❌ Файл слишком большой (максимум {MAX_FILE_SIZE // (1024*1024)} МБ)")
+        flash(f"❌ Файл слишком большой (максимум {human_size(effective_max_file_size())})")
         return redirect(url_for("cloud"))
     except QuotaExceeded:
         flash("❌ Квота хранилища исчерпана")
@@ -1193,7 +1807,7 @@ def share_file(file_id):
         return redirect(url_for("cloud"))
 
     token = secrets.token_urlsafe(24)
-    expires = dbnow(utcnow() + timedelta(hours=SHARE_TTL_HOURS))
+    expires = dbnow(utcnow() + timedelta(hours=effective_share_ttl_hours()))
 
     db = get_db()
     db.execute(
@@ -1374,7 +1988,7 @@ def ssh_page():
         certs=certs,
         now=dbnow(),
         principal=SSH_PRINCIPAL,
-        host=SSH_HOST_HINT,
+        host_hint=SSH_HOST_HINT,
         port=SSH_PORT,
         min_ttl=SSH_MIN_TTL,
         max_ttl=SSH_MAX_TTL,
@@ -1426,25 +2040,26 @@ def ssh_generate():
     db.commit()
 
     token = secrets.token_urlsafe(24)
-    SSH_BUNDLES[token] = {
-        "priv": priv, "cert": cert, "expires": time.time() + 600,
-    }
+    ssh_bundles_put(token, priv, cert)
     audit("ssh_cert_issued", f"id={cur.lastrowid} ttl={ttl}m")
 
     return render_template(
         "ssh_result.html",
         priv=priv, cert=cert, ttl=ttl, token=token,
         cert_id=cur.lastrowid, principal=SSH_PRINCIPAL,
-        host=SSH_HOST_HINT, port=SSH_PORT, expires=expires,
+        host_hint=SSH_HOST_HINT, port=SSH_PORT, expires=expires,
     )
 
 
 @app.route("/ssh/download/<token>/<kind>")
 @login_required
 def ssh_download(token, kind):
-    b = SSH_BUNDLES.get(token)
-    if not b or time.time() > b["expires"]:
+    b = ssh_bundles_get(token)
+    if not b:
         abort(404)
+    # Скачал ключ/сертификат — бандл в памяти больше не нужен (одноразовый).
+    with SSH_BUNDLES_LOCK:
+        SSH_BUNDLES.pop(token, None)
     if kind == "key":
         data, name = b["priv"], "goosko_key"
     elif kind == "cert":
@@ -1476,6 +2091,170 @@ def ssh_revoke(cert_id):
     else:
         flash("❌ Не удалось отозвать сертификат")
     return redirect(url_for("ssh_page"))
+
+
+# =====================================================================
+# ⚡ БЫСТРЫЙ ДОСТУП (только администраторы)
+# =====================================================================
+@app.route("/quick")
+@admin_required
+def quick_access_page():
+    media = []
+    try:
+        for p in sorted(MEDIA_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+            if p.is_file() and MEDIA_ID_RE.fullmatch(p.name):
+                kind = "Фото" if p.name.startswith("cam_photo") else \
+                       "Видео" if p.name.startswith("cam_video") else "Скриншот"
+                media.append({
+                    "id": p.name,
+                    "kind": kind,
+                    "size": p.stat().st_size,
+                    "mtime": datetime.fromtimestamp(p.stat().st_mtime).strftime("%d.%m.%Y %H:%M"),
+                })
+            if len(media) >= 100:
+                break
+    except OSError:
+        app.logger.exception("Failed to list media dir")
+
+    return render_template(
+        "quick.html",
+        config=QUICK_ACCESS_CONFIG,
+        media=media,
+        max_video_seconds=CAMERA_VIDEO_MAX_SECONDS,
+        photo_ttl_hours=CAMERA_PHOTO_TTL // 3600,
+        confirm_phrase=POWER_CONFIRM_PHRASE,
+    )
+
+
+def _list_media_ids():
+    ids = []
+    try:
+        for p in MEDIA_DIR.iterdir():
+            if p.is_file() and MEDIA_ID_RE.fullmatch(p.name):
+                ids.append(p.name)
+    except OSError:
+        pass
+    return ids
+
+
+@app.route("/quick/capture/photo", methods=["POST"])
+@admin_required
+@limiter.limit("20 per hour")
+def quick_capture_photo():
+    cleanup_media_files()
+    ok, info = capture_photo(QUICK_ACCESS_CONFIG)
+    if ok:
+        audit("quick_photo", os.path.basename(info))
+        flash(f"✅ Фото снято: {os.path.basename(info)}")
+    else:
+        flash(f"❌ Не удалось сделать фото: {info[:300]}")
+    return redirect(url_for("quick_access_page"))
+
+
+@app.route("/quick/capture/video", methods=["POST"])
+@admin_required
+@limiter.limit("10 per hour")
+def quick_capture_video():
+    try:
+        duration = int(request.form.get("duration", 10))
+    except (TypeError, ValueError):
+        duration = 0
+    if not (1 <= duration <= CAMERA_VIDEO_MAX_SECONDS):
+        flash(f"❌ Длительность: от 1 до {CAMERA_VIDEO_MAX_SECONDS} секунд")
+        return redirect(url_for("quick_access_page"))
+
+    cleanup_media_files()
+    ok, info = capture_video(QUICK_ACCESS_CONFIG, duration)
+    if ok:
+        audit("quick_video", f"{os.path.basename(info)} ({duration}s)")
+        flash(f"✅ Видео записано ({duration} с): {os.path.basename(info)}")
+    else:
+        flash(f"❌ Не удалось записать видео: {info[:300]}")
+    return redirect(url_for("quick_access_page"))
+
+
+@app.route("/quick/capture/screenshot", methods=["POST"])
+@admin_required
+@limiter.limit("30 per hour")
+def quick_capture_screenshot():
+    cleanup_media_files()
+    ok, info = capture_screenshot(QUICK_ACCESS_CONFIG)
+    if ok:
+        audit("quick_screenshot", os.path.basename(info))
+        flash(f"✅ Скриншот сделан: {os.path.basename(info)}")
+    else:
+        flash(f"❌ Не удалось сделать скриншот: {info[:300]}")
+    return redirect(url_for("quick_access_page"))
+
+
+@app.route("/quick/media/<media_id>")
+@admin_required
+def quick_media_view(media_id):
+    path = resolve_media_file(media_id)
+    if path is None:
+        abort(404)
+    mimetype = {
+        ".jpg": "image/jpeg", ".png": "image/png", ".mp4": "video/mp4",
+    }.get(os.path.splitext(media_id)[1].lower())
+    resp = send_file(path, mimetype=mimetype, conditional=True)
+    resp.headers["Cache-Control"] = "private, no-store"
+    resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+    return resp
+
+
+@app.route("/quick/delete", methods=["POST"])
+@admin_required
+def quick_delete_media():
+    media_id = request.form.get("id", "")
+    path = resolve_media_file(media_id)
+    if path is None:
+        flash("❌ Файл не найден")
+    else:
+        try:
+            os.remove(path)
+            audit("quick_media_deleted", media_id)
+            flash(f"🗑️ Удалено: {media_id}")
+        except OSError:
+            flash("❌ Не удалось удалить файл")
+    return redirect(url_for("quick_access_page"))
+
+
+@app.route("/quick/purge", methods=["POST"])
+@admin_required
+def quick_purge_media():
+    n = 0
+    for name in _list_media_ids():
+        try:
+            (MEDIA_DIR / name).unlink()
+            n += 1
+        except OSError:
+            app.logger.exception("Failed to purge media %s", name)
+    audit("quick_media_purged", f"{n} files")
+    flash(f"🧹 Удалено медиафайлов: {n}")
+    return redirect(url_for("quick_access_page"))
+
+
+@app.route("/quick/power/<action>", methods=["POST"])
+@admin_required
+@limiter.limit("5 per hour")
+def quick_power(action):
+    if action not in POWER_ACTIONS:
+        abort(404)
+    cmd, message = POWER_ACTIONS[action]
+
+    # Обязательное подтверждение фразой — защита от случайного/CSRF выключения.
+    if request.form.get("confirm", "").strip() != POWER_CONFIRM_PHRASE:
+        flash(f"❌ Для подтверждения введите фразу «{POWER_CONFIRM_PHRASE}»")
+        return redirect(url_for("quick_access_page"))
+
+    audit(f"quick_{action}", "requested")
+    ok, _, err = run_cmd(cmd, timeout=15)
+    if ok:
+        flash(message)
+        # Страница после выключения будет недоступна — редиректим на логин.
+        return redirect(url_for("index"))
+    flash(f"❌ Не удалось выполнить команду: {err.strip()[:300]}")
+    return redirect(url_for("quick_access_page"))
 
 
 # =====================================================================
