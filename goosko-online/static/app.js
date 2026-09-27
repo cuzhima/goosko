@@ -1,3 +1,15 @@
+function formatSize(bytes) {
+    if (!bytes || bytes < 0) return "0 Б";
+    const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let i = 0;
+    let value = bytes;
+    while (value >= 1024 && i < units.length - 1) {
+        value /= 1024;
+        i += 1;
+    }
+    return (i === 0 ? value : value.toFixed(1)) + " " + units[i];
+}
+
 function initProgressBars() {
     document.querySelectorAll("[data-progress]").forEach((el) => {
         const span = el.querySelector("span");
@@ -72,61 +84,106 @@ document.addEventListener("DOMContentLoaded", () => {
         dropzone.addEventListener("drop", (event) => {
             if (event.dataTransfer.files.length) {
                 input.files = event.dataTransfer.files;
+                input.dispatchEvent(new Event("change"));
             }
         });
 
         input.addEventListener("change", () => {
             const label = dropzone.querySelector("[data-file-name]");
-            if (label && input.files.length) {
+            if (!label) return;
+            if (input.files.length === 0) {
+                label.textContent = "Файлы не выбраны";
+            } else if (input.files.length === 1) {
                 label.textContent = input.files[0].name;
+            } else {
+                let total = 0;
+                for (const f of input.files) total += f.size;
+                label.textContent = `Выбрано файлов: ${input.files.length} (${formatSize(total)})`;
             }
         });
     });
 
-    // Прогресс загрузки файла
+    // Множественная загрузка через fetch с общим прогрессом
     document.querySelectorAll("form[data-upload-progress]").forEach((form) => {
         const progress = form.querySelector(".progress");
         const fill = progress?.querySelector("span");
+        const input = form.querySelector("input[type=file]");
+        if (!progress || !fill || !input) return;
 
-        if (!progress || !fill) return;
-
-        form.addEventListener("submit", (event) => {
+        form.addEventListener("submit", async (event) => {
             event.preventDefault();
 
-            const formData = new FormData(form);
-            const xhr = new XMLHttpRequest();
+            const files = Array.from(input.files || []);
+            if (files.length === 0) {
+                alert("Сначала выбери файл");
+                return;
+            }
 
-            xhr.open(form.method || "POST", form.action || window.location.href);
-            xhr.timeout = 0;
+            const submitBtn = form.querySelector("button[type=submit]");
+            if (submitBtn) submitBtn.disabled = true;
+            progress.hidden = false;
+            fill.style.width = "0%";
 
-            xhr.upload.onprogress = (event) => {
-                if (event.lengthComputable) {
-                    progress.hidden = false;
-                    const percent = Math.round((event.loaded / event.total) * 100);
-                    fill.style.width = percent + "%";
-                }
+            const setProgress = (percent, label) => {
+                fill.style.width = Math.round(percent) + "%";
+                if (label) fill.textContent = label;
             };
 
-            xhr.onload = () => {
-                if (xhr.status >= 200 && xhr.status < 400) {
-                    if (form.dataset.redirect) {
-                        window.location.href = form.dataset.redirect;
-                    } else {
-                        alert("✅ Загружено");
-                        progress.hidden = true;
-                        fill.style.width = "0";
-                        form.reset();
+            // Один запрос со всеми файлами, если сервер поддерживает API
+            try {
+                const totalBytes = files.reduce((s, f) => s + f.size, 0);
+                const formData = new FormData(form);
+                formData.delete("file");
+                for (const f of files) formData.append("files", f);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open("POST", "/cloud/upload-multi", true);
+                xhr.timeout = 0;
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        setProgress(
+                            (e.loaded / e.total) * 100,
+                            `${formatSize(e.loaded)} / ${formatSize(totalBytes)}`
+                        );
                     }
-                } else {
-                    alert("Ошибка загрузки: " + (xhr.responseText || xhr.status));
-                }
-            };
+                };
 
-            xhr.onerror = () => {
-                alert("Ошибка сети при загрузке файла");
-            };
+                xhr.onload = () => {
+                    let result = null;
+                    try { result = JSON.parse(xhr.responseText); } catch (_) {}
 
-            xhr.send(formData);
+                    if (result && Array.isArray(result.ok)) {
+                        const errs = result.errors || [];
+                        if (result.ok.length) {
+                            setProgress(100, `Загружено: ${result.ok.length}`);
+                        }
+                        const msg =
+                            `✅ Загружено файлов: ${result.ok.length}` +
+                            (errs.length ? `\n❌ Ошибки:\n${errs.join("\n")}` : "");
+                        alert(msg);
+                        window.location.href = form.dataset.redirect || "/cloud";
+                    } else if (xhr.status >= 200 && xhr.status < 400) {
+                        window.location.href = form.dataset.redirect || "/cloud";
+                    } else {
+                        alert("Ошибка загрузки: " + (xhr.responseText || xhr.status));
+                        progress.hidden = true;
+                        if (submitBtn) submitBtn.disabled = false;
+                    }
+                };
+
+                xhr.onerror = () => {
+                    alert("Ошибка сети при загрузке файлов");
+                    progress.hidden = true;
+                    if (submitBtn) submitBtn.disabled = false;
+                };
+
+                xhr.send(formData);
+            } catch (error) {
+                alert("Ошибка: " + error.message);
+                progress.hidden = true;
+                if (submitBtn) submitBtn.disabled = false;
+            }
         });
     });
 });

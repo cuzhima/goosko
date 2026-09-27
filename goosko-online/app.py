@@ -1,6 +1,6 @@
 from flask import (
     Flask, request, render_template, redirect, url_for,
-    session, flash, send_file, abort, g, Response,
+    session, flash, send_file, abort, g, Response, jsonify,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -116,6 +116,28 @@ app.wsgi_app = ProxyFix(
 )
 
 csrf = CSRFProtect(app)
+
+
+def _manual_csrf_ok() -> bool:
+    """Ручная проверка CSRF-токена (поле формы или заголовок X-CSRFToken).
+
+    Используется в маршрутах с @csrf.exempt, где токен передаётся из JS
+    (fetch/XHR) — возвращает True только при валидном токене.
+    """
+    from flask_wtf.csrf import validate_csrf
+    from wtforms import ValidationError
+
+    token = (
+        request.form.get("csrf_token")
+        or request.headers.get("X-CSRFToken")
+        or request.headers.get("X-CSRF-Token")
+    )
+    try:
+        validate_csrf(token)
+        return True
+    except ValidationError:
+        return False
+
 
 # Ограничение частоты запросов. Ключ — реальный IP клиента (с учётом
 # Cloudflare/Tailscale через ProxyFix), а не адрес прокси.
@@ -275,8 +297,18 @@ def init_db():
         ("files", "share_token", "TEXT"),
         ("files", "share_expires_at", "TEXT"),
         ("files", "download_count", "INTEGER NOT NULL DEFAULT 0"),
+        # Точный (мс) момент загрузки: created_at в SQLite имеет точность
+        # до секунды — файлы, загруженные в одну секунду, сортировались
+        # неверно. created_ms заполняется приложением.
+        ("files", "created_ms", "REAL"),
     ]:
         add_column(conn, table, column, ctype)
+
+    # Backfill created_ms для старых записей (приблизительно из created_at).
+    conn.execute(
+        "UPDATE files SET created_ms = strftime('%s', created_at) * 1000 "
+        "WHERE created_ms IS NULL AND created_at IS NOT NULL"
+    )
 
     if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         admin_password = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(16)
@@ -658,6 +690,7 @@ def get_active_file_by_path(zone, rel_path):
 
 def unique_rel_path(base_dir, prefix, filename, zone):
     name, ext = os.path.splitext(filename)
+    used_names = {filename}
     candidate = filename
     for _ in range(100):
         rel = f"{prefix}/{candidate}" if prefix else candidate
@@ -666,25 +699,31 @@ def unique_rel_path(base_dir, prefix, filename, zone):
             abort(403)
         if not os.path.exists(physical) and not active_file_exists(zone, rel):
             return rel
+        # суффикс добавляем к базовому имени ровно один раз (без "name_x_y")
         candidate = f"{name}_{secrets.token_hex(4)}{ext}"
+        while candidate in used_names:
+            candidate = f"{name}_{secrets.token_hex(4)}{ext}"
+        used_names.add(candidate)
     abort(500)
 
 
 def upsert_file_record(owner, zone, rel_path, original_name, size):
     db = get_db()
+    now_ms = time.time() * 1000
     row = db.execute(
         "SELECT id FROM files WHERE zone=? AND rel_path=? AND deleted_at IS NULL",
         (zone, rel_path),
     ).fetchone()
     if row:
         db.execute(
-            "UPDATE files SET owner=?, original_name=?, size=? WHERE id=?",
-            (owner, original_name, size, row["id"]),
+            "UPDATE files SET owner=?, original_name=?, size=?, created_ms=? WHERE id=?",
+            (owner, original_name, size, now_ms, row["id"]),
         )
     else:
         db.execute(
-            "INSERT INTO files (owner, zone, rel_path, original_name, size) VALUES (?,?,?,?,?)",
-            (owner, zone, rel_path, original_name, size),
+            "INSERT INTO files (owner, zone, rel_path, original_name, size, created_ms)"
+            " VALUES (?,?,?,?,?,?)",
+            (owner, zone, rel_path, original_name, size, now_ms),
         )
     db.commit()
 
@@ -735,7 +774,19 @@ def file_to_dict(row):
     }
 
 
-def list_files(zone=None, owner=None, private_username=None, q=None):
+# Допустимые варианты сортировки списков файлов (?sort=...)
+SORT_OPTIONS = {
+    # created_ms (мс, точность до миллисекунды) с фолбэком на created_at
+    "new": ("COALESCE(created_ms, strftime('%s', created_at) * 1000) DESC", "Сначала новые"),
+    "old": ("COALESCE(created_ms, strftime('%s', created_at) * 1000) ASC", "Сначала старые"),
+    "name_asc": ("original_name COLLATE NOCASE ASC", "Имя А→Я"),
+    "name_desc": ("original_name COLLATE NOCASE DESC", "Имя Я→А"),
+    "size_desc": ("size DESC", "Размер ↓"),
+    "size_asc": ("size ASC", "Размер ↑"),
+}
+
+
+def list_files(zone=None, owner=None, private_username=None, q=None, sort="new"):
     db = get_db()
     sql = "SELECT * FROM files WHERE deleted_at IS NULL"
     params = []
@@ -759,7 +810,9 @@ def list_files(zone=None, owner=None, private_username=None, q=None):
         like = f"%{escaped}%"
         params.extend([like, like])
 
-    sql += " ORDER BY created_at DESC LIMIT 1000"
+    order = SORT_OPTIONS.get(sort, SORT_OPTIONS["new"])[0]
+    # id — уникальный tie-breaker, чтобы пагинация/перерисовка были стабильны
+    sql += f" ORDER BY {order}, id DESC LIMIT 1000"
     rows = db.execute(sql, params).fetchall()
     return [file_to_dict(r) for r in rows]
 
@@ -1629,14 +1682,19 @@ def account_change_password():
 @login_required
 def cloud():
     q = request.args.get("q", "").strip()[:200]
+    sort = request.args.get("sort", "new")
+    if sort not in SORT_OPTIONS:
+        sort = "new"
     username = session["user"]
     is_admin = session.get("is_admin", False)
 
-    public_files = list_files(zone="public", q=q)
+    public_files = list_files(zone="public", q=q, sort=sort)
     if is_admin:
-        private_files = list_files(zone="private", q=q)
+        private_files = list_files(zone="private", q=q, sort=sort)
     else:
-        private_files = list_files(private_username=secure_filename(username), q=q)
+        private_files = list_files(
+            private_username=secure_filename(username), q=q, sort=sort
+        )
 
     users = []
     if is_admin:
@@ -1657,6 +1715,7 @@ def cloud():
         users=users, q=q, usage=usage, quota_percent=quota_percent,
         user_quota=quota,
         max_file_size=effective_max_file_size(),
+        sort=sort, sort_options=SORT_OPTIONS,
     )
 
 
@@ -1705,6 +1764,84 @@ def cloud_purge_trash():
 # =====================================================================
 # ОБЛАКО: ЗАГРУЗКА
 # =====================================================================
+def store_uploaded_file(user_row, zone, safe_name, stream_factory, owner=None):
+    """Общая логика сохранения загруженного файла (для form- и JSON-API).
+
+    stream_factory() возвращает открытый binary file-like объект.
+    owner — владелец хранилища (для загрузки админом в private-зону другого
+    пользователя); по умолчанию — сам загружающий.
+    Возвращает dict с полями: name, size, url, full_url.
+    Бросает ValueError с человекочитаемым сообщением при ошибках валидации.
+    """
+    username = user_row["username"]
+    is_admin_user = bool(user_row["is_admin"])
+
+    if zone not in ("public", "private"):
+        raise ValueError("Неверная зона")
+    if not safe_name:
+        raise ValueError("Недопустимое имя файла")
+    if zone == "public" and not is_admin_user and not is_safe_public_filename(safe_name):
+        raise ValueError("Этот тип файла запрещён для публичной зоны обычным пользователям")
+
+    max_size = effective_max_file_size()
+    if zone == "public":
+        if not valid_username(username):
+            raise ValueError("Недопустимое имя пользователя")
+        base_dir = PUBLIC_DIR
+        if is_admin_user:
+            prefix = ""
+        else:
+            prefix = secure_filename(username)
+            ensure_dir(os.path.join(PUBLIC_DIR, prefix))
+        owner = username
+    else:
+        if owner is None:
+            owner = username
+        if not valid_username(owner):
+            raise ValueError("Недопустимое имя пользователя")
+        base_dir = PRIVATE_DIR
+        prefix = secure_filename(owner)
+        get_user_private_dir(owner)  # гарантирует существование каталога
+
+    remaining = None if is_admin_user else quota_remaining(owner)
+    if remaining is not None and remaining <= 0:
+        raise ValueError("Квота хранилища исчерпана")
+
+    rel_path = unique_rel_path(base_dir, prefix, safe_name, zone)
+    target_path = safe_storage_path(base_dir, rel_path)
+
+    stream = stream_factory()
+    try:
+        size = save_upload_stream(
+            stream, target_path,
+            max_size=max_size, quota_remaining=remaining,
+        )
+    except UploadTooLarge:
+        raise ValueError(f"Файл слишком большой (максимум {human_size(max_size)})")
+    except QuotaExceeded:
+        raise ValueError("Квота хранилища исчерпана")
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    upsert_file_record(owner, zone, rel_path, safe_name, size)
+
+    if zone == "public":
+        url = f"/public/{quote(rel_path)}"
+    else:
+        username_part, filename_part = rel_path.split("/", 1)
+        url = f"/private/{quote(username_part)}/{quote(filename_part)}"
+
+    return {
+        "name": safe_name,
+        "size": size,
+        "url": url,
+        "full_url": PUBLIC_BASE_URL + url,
+    }
+
+
 @app.route("/cloud/upload", methods=["POST"])
 @login_required
 def cloud_upload():
@@ -1728,83 +1865,91 @@ def cloud_upload():
 
     is_admin = session.get("is_admin", False)
 
-    if zone == "private":
-        if is_admin:
-            target_user = request.form.get("target_user", session["user"]).strip()
-        else:
-            target_user = session["user"]
+    if zone == "private" and is_admin:
+        target_user = request.form.get("target_user", session["user"]).strip()
     else:
         target_user = session["user"]
 
-    if not valid_username(target_user):
-        flash("❌ Недопустимое имя пользователя")
-        return redirect(url_for("cloud"))
-
-    target_row = get_user_row(target_user)
-    if not target_row:
+    user_row = get_user_row(session["user"])
+    if not user_row:
         flash("❌ Пользователь не найден")
         return redirect(url_for("cloud"))
 
+    if zone == "private" and target_user != session["user"]:
+        # админ может загружать в private-зону другого пользователя
+        if not get_user_row(target_user):
+            flash("❌ Пользователь не найден")
+            return redirect(url_for("cloud"))
+
     safe_name = secure_filename(file.filename)
-    if not safe_name:
-        flash("❌ Недопустимое имя файла")
-        return redirect(url_for("cloud"))
-
-    if zone == "public" and not is_admin and not is_safe_public_filename(safe_name):
-        flash("❌ Этот тип файла запрещён для публичной зоны обычным пользователям")
-        return redirect(url_for("cloud"))
-
-    if zone == "public":
-        base_dir = PUBLIC_DIR
-        if is_admin:
-            prefix = ""
-            target_dir = PUBLIC_DIR
-            owner = session["user"]
-        else:
-            prefix = secure_filename(session["user"])
-            target_dir = os.path.join(PUBLIC_DIR, prefix)
-            ensure_dir(target_dir)
-            owner = session["user"]
-    else:
-        base_dir = PRIVATE_DIR
-        prefix = secure_filename(target_user)
-        target_dir = get_user_private_dir(target_user)
-        owner = target_user
-
-    owner_admin = is_admin_username(owner)
-    remaining = None if owner_admin else quota_remaining(owner)
-
-    if remaining is not None and remaining <= 0:
-        flash("❌ Квота хранилища исчерпана")
-        return redirect(url_for("cloud"))
-
-    rel_path = unique_rel_path(base_dir, prefix, safe_name, zone)
-    target_path = safe_storage_path(base_dir, rel_path)
 
     try:
-        size = save_upload_stream(
-            file.stream, target_path,
-            max_size=effective_max_file_size(), quota_remaining=remaining,
+        info = store_uploaded_file(
+            user_row, zone, safe_name, lambda: file.stream,
+            owner=target_user if zone == "private" else None,
         )
-    except UploadTooLarge:
-        flash(f"❌ Файл слишком большой (максимум {human_size(effective_max_file_size())})")
-        return redirect(url_for("cloud"))
-    except QuotaExceeded:
-        flash("❌ Квота хранилища исчерпана")
+    except ValueError as e:
+        flash(f"❌ {e}")
         return redirect(url_for("cloud"))
 
-    upsert_file_record(owner, zone, rel_path, safe_name, size)
-    audit("upload", f"{zone}:{rel_path}")
-
-    if zone == "public":
-        link = public_url(rel_path)
-    else:
-        username_part, filename_part = rel_path.split("/", 1)
-        link = private_url(username_part, filename_part)
-
+    audit("upload", f"{zone}:{info['url']}")
     flash(f"✅ Файл загружен: {safe_name}")
-    flash(f"🔗 Ссылка: {link}")
+    flash(f"🔗 Ссылка: {info['full_url']}")
     return redirect(url_for("cloud"))
+
+
+@app.route("/cloud/upload-multi", methods=["POST"])
+@login_required
+@limiter.limit("120 per minute")
+@csrf.exempt
+def cloud_upload_multi():
+    """Множественная загрузка через fetch (multipart с несколькими файлами).
+
+    Ответ всегда JSON: {"ok": [...], "errors": [...]}, HTTP 200/400.
+    """
+    # CSRF: маршрут исключён из глобальной проверки (токен может приходить
+    # в заголовке X-CSRFToken из fetch), поэтому проверяем вручную.
+    if not _manual_csrf_ok():
+        return jsonify(ok=[], errors=["Сессия устарела, обнови страницу"]), 400
+
+    files = request.files.getlist("files") or request.files.getlist("file")
+    if not files or all(f.filename == "" for f in files):
+        return jsonify(ok=[], errors=["Файлы не выбраны"]), 400
+
+    zone = request.form.get("zone", "private")
+    user_row = get_user_row(session["user"])
+    if not user_row:
+        return jsonify(ok=[], errors=["Пользователь не найден"]), 400
+
+    max_size = effective_max_file_size()
+    ok_list, errors = [], []
+
+    for f in files:
+        if not f.filename:
+            continue
+        safe_name = secure_filename(f.filename)
+        if not safe_name:
+            errors.append(f"{f.filename}: недопустимое имя файла")
+            continue
+        try:
+            # save_upload_stream читает file.stream напрямую; повторное
+            # использование одного stream между файлами невозможно — Flask
+            # даёт отдельный FileStorage на каждый файл, поэтому ок.
+            info = store_uploaded_file(
+                user_row, zone, safe_name, lambda f=f: f.stream
+            )
+        except ValueError as e:
+            errors.append(f"{f.filename}: {e}")
+            continue
+        ok_list.append(info)
+
+    if ok_list:
+        audit(
+            "upload_multi",
+            "; ".join(f"{zone}:{i['url']}" for i in ok_list)[:500],
+        )
+    status = 200 if ok_list and not errors else (207 if ok_list else 400)
+    return jsonify(ok=ok_list, errors=errors), status
 
 
 # =====================================================================
@@ -1834,16 +1979,12 @@ def upload_big(token):
     if not user_row:
         return "❌ Пользователь не найден", 403
 
-    user_admin = bool(user_row["is_admin"])
 
     if request.method == "GET":
         return render_template("upload_big.html", token=token, user=username)
 
     if "file" not in request.files or request.files["file"].filename == "":
         return "❌ Файл не выбран", 400
-
-    if request.content_length and request.content_length > MAX_FILE_SIZE:
-        return "❌ Файл больше 4 ГБ", 413
 
     file = request.files["file"]
     zone = request.form.get("zone", "private")
@@ -1854,48 +1995,19 @@ def upload_big(token):
     if not safe_name:
         return "❌ Недопустимое имя файла", 400
 
-    if zone == "public" and not user_admin and not is_safe_public_filename(safe_name):
-        return "❌ Этот тип файла запрещён для публичной зоны обычным пользователям", 400
-
-    if zone == "private":
-        base_dir = PRIVATE_DIR
-        prefix = secure_filename(username)
-        target_dir = get_user_private_dir(username)
-        owner = username
-    else:
-        base_dir = PUBLIC_DIR
-        if user_admin:
-            prefix = ""
-            target_dir = PUBLIC_DIR
-        else:
-            prefix = secure_filename(username)
-            target_dir = os.path.join(PUBLIC_DIR, prefix)
-            ensure_dir(target_dir)
-        owner = username
-
-    remaining = None if user_admin else quota_remaining(owner)
-    if remaining is not None and remaining <= 0:
-        return "❌ Квота хранилища исчерпана", 413
-
-    rel_path = unique_rel_path(base_dir, prefix, safe_name, zone)
-    target_path = safe_storage_path(base_dir, rel_path)
-
     try:
-        size = save_upload_stream(
-            file.stream, target_path,
-            max_size=MAX_FILE_SIZE, quota_remaining=remaining,
-        )
-    except UploadTooLarge:
-        return "❌ Файл больше 4 ГБ", 413
-    except QuotaExceeded:
-        return "❌ Квота хранилища исчерпана", 413
+        info = store_uploaded_file(user_row, zone, safe_name, lambda: file.stream)
+    except ValueError as e:
+        msg = str(e)
+        # 413 — для квоты/размера, 400 — для остальных ошибок валидации
+        status = 413 if ("Квота" in msg or "слишком большой" in msg) else 400
+        return f"❌ {msg}", status
 
-    upsert_file_record(owner, zone, rel_path, safe_name, size)
     try:
         db = get_db()
         db.execute(
             "INSERT INTO audit_log (username, action, details, ip) VALUES (?,?,?,?)",
-            (username, "upload_big", f"{zone}:{rel_path}", request.remote_addr),
+            (username, "upload_big", f"{zone}:{info['url']}", request.remote_addr),
         )
         db.commit()
     except Exception:
@@ -2247,7 +2359,8 @@ def admin_settings_save():
 # =====================================================================
 AUDIT_ACTIONS = [
     "", "login_failed", "login", "logout", "password_changed",
-    "file_uploaded", "file_big_uploaded", "file_deleted", "file_restored",
+    "file_uploaded", "upload", "upload_multi", "file_big_uploaded", "upload_big",
+    "file_deleted", "file_restored",
     "file_purged", "trash_purged", "share_created", "download",
     "user_added", "user_deleted", "settings_changed", "backup_downloaded",
     "ssh_cert_issued", "ssh_cert_revoked", "ssh_bundle_downloaded",
