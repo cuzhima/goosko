@@ -415,3 +415,76 @@ tr:last-child td {
     max-width: 220px;
     border-radius: 10px;
 }
+
+/* --- Мобильная адаптация (дополнение к базовым правилам) --- */
+@media (max-width: 720px) {
+    main {
+        padding: 16px 0 40px;
+    }
+
+    .card {
+        padding: 12px;
+        border-radius: 12px;
+    }
+
+    /* Навигация: компактные ссылки в одну прокручиваемую строку */
+    .nav {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        max-width: 100%;
+        padding-bottom: 4px;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .nav a {
+        white-space: nowrap;
+        padding: 6px 8px;
+        font-size: 0.92rem;
+    }
+
+    /* Таблицы не должны расширять страницу целиком */
+    table {
+        min-width: 560px;
+    }
+
+    th,
+    td {
+        padding: 8px;
+        font-size: 0.9rem;
+    }
+
+    /* Кнопки и поля форм — на всю ширину, удобно попадать пальцем */
+    .btn,
+    input[type="text"],
+    input[type="password"],
+    input[type="number"],
+    input[type="file"],
+    select {
+        width: 100%;
+    }
+
+    .btn.small {
+        width: auto;
+    }
+
+    /* Превью медиа — адаптивные */
+    .media-thumb {
+        max-width: 100%;
+    }
+
+    video,
+    img.preview {
+        max-width: 100%;
+        height: auto;
+    }
+
+    /* Поисковая форма и сетка действий */
+    .search-form {
+        display: grid;
+        gap: 8px;
+    }
+
+    h1 {
+        font-size: 1.3rem;
+    }
+}
