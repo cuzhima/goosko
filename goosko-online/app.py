@@ -1,6 +1,6 @@
 from flask import (
     Flask, request, render_template, redirect, url_for,
-    session, flash, send_file, abort, g, Response,
+    session, flash, send_file, abort, g, Response, jsonify,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -12,6 +12,7 @@ from flask_limiter.util import get_remote_address
 
 import sqlite3
 import functools
+import atexit
 import os
 import secrets
 import re
@@ -30,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
+from flask.helpers import stream_with_context
 
 
 # =====================================================================
@@ -116,6 +118,28 @@ app.wsgi_app = ProxyFix(
 
 csrf = CSRFProtect(app)
 
+
+def _manual_csrf_ok() -> bool:
+    """Ручная проверка CSRF-токена (поле формы или заголовок X-CSRFToken).
+
+    Используется в маршрутах с @csrf.exempt, где токен передаётся из JS
+    (fetch/XHR) — возвращает True только при валидном токене.
+    """
+    from flask_wtf.csrf import validate_csrf
+    from wtforms import ValidationError
+
+    token = (
+        request.form.get("csrf_token")
+        or request.headers.get("X-CSRFToken")
+        or request.headers.get("X-CSRF-Token")
+    )
+    try:
+        validate_csrf(token)
+        return True
+    except ValidationError:
+        return False
+
+
 # Ограничение частоты запросов. Ключ — реальный IP клиента (с учётом
 # Cloudflare/Tailscale через ProxyFix), а не адрес прокси.
 def client_key():
@@ -126,7 +150,37 @@ limiter = Limiter(
     app=app,
     default_limits=["200 per hour", "30 per minute"],
     storage_uri="memory://",
+    enabled=os.environ.get("RATELIMIT_ENABLED", "1") == "1",
 )
+
+
+# =====================================================================
+# ⚡ БЫСТРЫЙ ДОСТУП — вынесен в модуль quick_access.py (рефакторинг п.10).
+# init_app внедряет зависимости (БД, аудит, права, отдача файлов) и
+# регистрирует blueprint. Все зависимости передаются лениво: функции
+# определены ниже по ходу app.py, а вызываются только при обработке
+# запросов. Blueprint создаётся здесь же и регистрируется сразу —
+# иначе при повторном импорте app.py (тесты чистят sys.modules) новый
+# объект Flask не получил бы маршруты /quick/*.
+# =====================================================================
+import quick_access as qa
+
+qa_bp = qa.make_blueprint()
+app.register_blueprint(qa_bp)
+
+qa.init_app(
+    app,
+    get_db_fn=lambda: get_db(),
+    audit_fn=lambda *a, **k: audit(*a, **k),
+    send_streamable_fn=lambda *a, **k: send_streamable(*a, **k),
+    admin_required_fn=lambda f: admin_required(f),
+    max_video_seconds_fn=lambda: effective_camera_max_video_seconds(),
+    preview_enabled_fn=lambda: effective_camera_preview_enabled(),
+    ensure_dir_fn=ensure_dir,
+    limiter=limiter,
+)
+MEDIA_DIR = qa.MEDIA_DIR
+CAMERA_VIDEO_MAX_SECONDS = qa.CAMERA_VIDEO_MAX_SECONDS
 
 
 # =====================================================================
@@ -264,6 +318,14 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active
             ON files(zone, rel_path) WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner);
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'running',
+            filename TEXT,
+            error TEXT,
+            duration INTEGER,
+            started_at REAL NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_files_zone ON files(zone);
     """)
 
@@ -273,8 +335,30 @@ def init_db():
         ("files", "share_token", "TEXT"),
         ("files", "share_expires_at", "TEXT"),
         ("files", "download_count", "INTEGER NOT NULL DEFAULT 0"),
+        # Точный (мс) момент загрузки: created_at в SQLite имеет точность
+        # до секунды — файлы, загруженные в одну секунду, сортировались
+        # неверно. created_ms заполняется приложением.
+        ("files", "created_ms", "REAL"),
     ]:
         add_column(conn, table, column, ctype)
+
+    # Backfill created_ms для старых записей (приблизительно из created_at).
+    conn.execute(
+        "UPDATE files SET created_ms = strftime('%s', created_at) * 1000 "
+        "WHERE created_ms IS NULL AND created_at IS NOT NULL"
+    )
+
+    # Миграция старых БД: таблица задач быстрой видеосъёмки.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'running',
+            filename TEXT,
+            error TEXT,
+            duration INTEGER,
+            started_at REAL NOT NULL
+        )
+    """)
 
     if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         admin_password = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(16)
@@ -295,6 +379,7 @@ def init_db():
         "user_quota_bytes": str(USER_QUOTA),
         "max_file_size_bytes": str(MAX_FILE_SIZE),
         "share_ttl_hours": str(SHARE_TTL_HOURS),
+        "stream_uploads": os.environ.get("STREAM_UPLOADS", "1"),
     }
     for key, value in defaults.items():
         try:
@@ -340,6 +425,21 @@ def effective_trash_retention_days():
     return max(0, get_int_setting("trash_retention_days", 30))
 
 
+def effective_stream_uploads():
+    """Потоковая (chunked) отдача файлов с Range вместо whole-file send_file."""
+    return get_int_setting("stream_uploads", 1) == 1
+
+
+def effective_camera_max_video_seconds():
+    return max(1, get_int_setting(
+        "camera_max_video_seconds", CAMERA_VIDEO_MAX_SECONDS))
+
+
+def effective_camera_preview_enabled():
+    """Живое MJPEG-превью камеры на странице Быстрого доступа."""
+    return get_int_setting("camera_preview_enabled", 1) == 1
+
+
 def get_db():
     if "db" not in g:
         conn = sqlite3.connect(DB, timeout=15)
@@ -359,6 +459,11 @@ def close_db(exception=None):
 
 
 init_db()
+
+# Фоновая автоочистка корзины/медиа/SSH-бандлов запускается только при
+# реальной работе сервера (не под pytest, чтобы не плодить потоки в тестах).
+if os.environ.get("GOOSKO_DISABLE_MAINTENANCE") != "1":
+    start_background_maintenance()
 
 
 # =====================================================================
@@ -563,7 +668,7 @@ def start_background_maintenance():
             except Exception:
                 app.logger.exception("Background trash cleanup failed")
             try:
-                m = cleanup_media_files()
+                m = qa.cleanup_media_files()
                 if m:
                     app.logger.info("Media cleanup: removed %d files", m)
             except Exception:
@@ -572,6 +677,11 @@ def start_background_maintenance():
                 ssh_bundles_cleanup()
             except Exception:
                 app.logger.exception("SSH bundles cleanup failed")
+            try:
+                with app.app_context():
+                    qa.cleanup_tasks()
+            except Exception:
+                app.logger.exception("Tasks cleanup failed")
 
     t = threading.Thread(target=worker, daemon=True, name="goosko-maintenance")
     t.start()
@@ -640,6 +750,7 @@ def get_active_file_by_path(zone, rel_path):
 
 def unique_rel_path(base_dir, prefix, filename, zone):
     name, ext = os.path.splitext(filename)
+    used_names = {filename}
     candidate = filename
     for _ in range(100):
         rel = f"{prefix}/{candidate}" if prefix else candidate
@@ -648,25 +759,31 @@ def unique_rel_path(base_dir, prefix, filename, zone):
             abort(403)
         if not os.path.exists(physical) and not active_file_exists(zone, rel):
             return rel
+        # суффикс добавляем к базовому имени ровно один раз (без "name_x_y")
         candidate = f"{name}_{secrets.token_hex(4)}{ext}"
+        while candidate in used_names:
+            candidate = f"{name}_{secrets.token_hex(4)}{ext}"
+        used_names.add(candidate)
     abort(500)
 
 
 def upsert_file_record(owner, zone, rel_path, original_name, size):
     db = get_db()
+    now_ms = time.time() * 1000
     row = db.execute(
         "SELECT id FROM files WHERE zone=? AND rel_path=? AND deleted_at IS NULL",
         (zone, rel_path),
     ).fetchone()
     if row:
         db.execute(
-            "UPDATE files SET owner=?, original_name=?, size=? WHERE id=?",
-            (owner, original_name, size, row["id"]),
+            "UPDATE files SET owner=?, original_name=?, size=?, created_ms=? WHERE id=?",
+            (owner, original_name, size, now_ms, row["id"]),
         )
     else:
         db.execute(
-            "INSERT INTO files (owner, zone, rel_path, original_name, size) VALUES (?,?,?,?,?)",
-            (owner, zone, rel_path, original_name, size),
+            "INSERT INTO files (owner, zone, rel_path, original_name, size, created_ms)"
+            " VALUES (?,?,?,?,?,?)",
+            (owner, zone, rel_path, original_name, size, now_ms),
         )
     db.commit()
 
@@ -717,7 +834,19 @@ def file_to_dict(row):
     }
 
 
-def list_files(zone=None, owner=None, private_username=None, q=None):
+# Допустимые варианты сортировки списков файлов (?sort=...)
+SORT_OPTIONS = {
+    # created_ms (мс, точность до миллисекунды) с фолбэком на created_at
+    "new": ("COALESCE(created_ms, strftime('%s', created_at) * 1000) DESC", "Сначала новые"),
+    "old": ("COALESCE(created_ms, strftime('%s', created_at) * 1000) ASC", "Сначала старые"),
+    "name_asc": ("original_name COLLATE NOCASE ASC", "Имя А→Я"),
+    "name_desc": ("original_name COLLATE NOCASE DESC", "Имя Я→А"),
+    "size_desc": ("size DESC", "Размер ↓"),
+    "size_asc": ("size ASC", "Размер ↑"),
+}
+
+
+def list_files(zone=None, owner=None, private_username=None, q=None, sort="new"):
     db = get_db()
     sql = "SELECT * FROM files WHERE deleted_at IS NULL"
     params = []
@@ -741,7 +870,9 @@ def list_files(zone=None, owner=None, private_username=None, q=None):
         like = f"%{escaped}%"
         params.extend([like, like])
 
-    sql += " ORDER BY created_at DESC LIMIT 1000"
+    order = SORT_OPTIONS.get(sort, SORT_OPTIONS["new"])[0]
+    # id — уникальный tie-breaker, чтобы пагинация/перерисовка были стабильны
+    sql += f" ORDER BY {order}, id DESC LIMIT 1000"
     rows = db.execute(sql, params).fetchall()
     return [file_to_dict(r) for r in rows]
 
@@ -914,170 +1045,6 @@ def check_upload_token(token):
 
 
 # =====================================================================
-# ⚡ БЫСТРЫЙ ДОСТУП: КАМЕРА / СКРИНШОТЫ / ПИТАНИЕ СЕРВЕРА
-# =====================================================================
-MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", os.path.join(STORAGE_DIR, "media")))
-ensure_dir(str(MEDIA_DIR))
-
-CAMERA_PHOTO_TTL = int(os.environ.get("CAMERA_PHOTO_TTL", 24 * 3600))    # 1 сутки
-CAMERA_VIDEO_MAX_SECONDS = int(os.environ.get("CAMERA_VIDEO_MAX_SECONDS", 120))
-
-
-@dataclass(frozen=True)
-class Config:
-    """Конфигурация быстрого доступа (значения из окружения)."""
-    video_device: str
-    resolution: str
-    screen_device: str
-    wayland_display: str
-    ffmpeg_timeout: int
-
-
-QUICK_ACCESS_CONFIG = Config(
-    video_device=os.environ.get("CAMERA_DEVICE", "/dev/video0"),
-    resolution=os.environ.get("CAMERA_RESOLUTION", "1280x720"),
-    screen_device=os.environ.get("SCREEN_DEVICE", ":1.0+0,0"),
-    wayland_display=os.environ.get("WAYLAND_DISPLAY_ENV", "wayland-0"),
-    ffmpeg_timeout=int(os.environ.get("FFMPEG_TIMEOUT", 30)),
-)
-
-
-def run_cmd(cmd, timeout=30, env=None):
-    """Запуск команды без shell (списком аргументов). -> (ok, stdout, stderr)"""
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, env=env,
-        )
-        return proc.returncode == 0, proc.stdout, proc.stderr
-    except FileNotFoundError:
-        return False, "", f"Не найдена программа: {cmd[0]}"
-    except subprocess.TimeoutExpired:
-        return False, "", f"Превышен таймаут ({timeout} с): {' '.join(cmd[:3])}…"
-    except Exception as exc:  # защита от любых ошибок запуска
-        app.logger.exception("run_cmd failed")
-        return False, "", str(exc)
-
-
-def quick_access_env():
-    """Окружение для grab/wl-clipboard-scrcpy (нужен доступ к сессии Wayland)."""
-    env = os.environ.copy()
-    env.setdefault("WAYLAND_DISPLAY", QUICK_ACCESS_CONFIG.wayland_display)
-    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    env.setdefault("DBUS_SESSION_BUS_ADDRESS",
-                   f"unix:path={env['XDG_RUNTIME_DIR']}/bus")
-    return env
-
-
-def capture_photo(config: Config) -> tuple[bool, str]:
-    """Делает фото с веб-камеры."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = MEDIA_DIR / f"cam_photo_{timestamp}_{uuid.uuid4().hex[:8]}.jpg"
-
-    ok, _, err = run_cmd([
-        "ffmpeg", "-y",
-        "-f", "v4l2", "-video_size", config.resolution,
-        "-i", config.video_device,
-        "-vframes", "1",
-        "-ss", "00:00:02",
-        str(filepath)
-    ], timeout=config.ffmpeg_timeout)
-
-    if not ok or not filepath.exists():
-        if filepath.exists():
-            try:
-                filepath.unlink()
-            except OSError:
-                pass
-        return False, err.strip() or "Ошибка ffmpeg"
-    return True, str(filepath)
-
-
-def capture_video(config: Config, duration: int) -> tuple[bool, str]:
-    """Записывает видео с веб-камеры."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = MEDIA_DIR / f"cam_video_{timestamp}_{uuid.uuid4().hex[:8]}.mp4"
-
-    ok, _, err = run_cmd([
-        "ffmpeg", "-y",
-        "-f", "v4l2", "-video_size", config.resolution,
-        "-i", config.video_device,
-        "-t", str(duration),
-        "-c:v", "libx264", "-preset", "fast",
-        "-pix_fmt", "yuv420p",
-        str(filepath)
-    ], timeout=config.ffmpeg_timeout + duration + 10)
-
-    if not ok or not filepath.exists():
-        if filepath.exists():
-            try:
-                filepath.unlink()
-            except OSError:
-                pass
-        return False, err.strip() or "Ошибка ffmpeg"
-    return True, str(filepath)
-
-
-def capture_screenshot(config: Config) -> tuple[bool, str]:
-    """Делает скриншот экрана сервера (grab — для X11/Wayland через PipeWire)."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = MEDIA_DIR / f"screenshot_{timestamp}_{uuid.uuid4().hex[:8]}.png"
-
-    ok, _, err = run_cmd(
-        ["grab", "--filename", str(filepath), config.screen_device],
-        timeout=config.ffmpeg_timeout, env=quick_access_env(),
-    )
-    if not ok or not filepath.exists():
-        if filepath.exists():
-            try:
-                filepath.unlink()
-            except OSError:
-                pass
-        return False, err.strip() or "grab не установлен или экран недоступен"
-    return True, str(filepath)
-
-
-MEDIA_ID_RE = re.compile(r"^(cam_photo|cam_video|screenshot)_\d{8}_\d{6}_[0-9a-f]{8}\.(jpg|mp4|png)$")
-
-
-def resolve_media_file(media_id):
-    """Строго по белому списку имён находим файл медиа (защита от path traversal)."""
-    if not MEDIA_ID_RE.fullmatch(media_id or ""):
-        return None
-    path = MEDIA_DIR / media_id
-    if not path.is_file():
-        return None
-    return str(path)
-
-
-def cleanup_media_files(max_age_hours=CAMERA_PHOTO_TTL // 3600):
-    """Удаляет устаревшие медиа быстрой съёмки. Возвращает число удалённых."""
-    cutoff = time.time() - max_age_hours * 3600
-    removed = 0
-    try:
-        for p in MEDIA_DIR.iterdir():
-            if not MEDIA_ID_RE.fullmatch(p.name):
-                continue
-            try:
-                if p.is_file() and p.stat().st_mtime < cutoff:
-                    p.unlink()
-                    removed += 1
-            except OSError:
-                app.logger.exception("Failed to purge media %s", p)
-    except OSError:
-        pass
-    return removed
-
-
-POWER_ACTIONS = {
-    "shutdown": (["sudo", "-n", "/usr/local/bin/goosko-power.sh", "poweroff"],
-                 "Сервер выключается 🛑"),
-    "reboot":   (["sudo", "-n", "/usr/local/bin/goosko-power.sh", "reboot"],
-                 "Сервер перезагрушивается ♻️"),
-}
-POWER_CONFIRM_PHRASE = "Я УВЕРЕН"
-
-
-# =====================================================================
 # 🔐 SSH-СЕРТИФИКАТЫ
 # =====================================================================
 SSH_PRINCIPAL = os.environ.get("SSH_PRINCIPAL", "andrey")
@@ -1184,6 +1151,10 @@ def security_headers(response):
         "base-uri 'none'; frame-ancestors 'none'; connect-src 'self'; "
         "form-action 'self'; frame-src 'none'"
     )
+
+    # MJPEG-превью камеры — картинка с того же origin (см. quick_camera_stream).
+    if request.path == "/quick/stream.mjpg":
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
 
     # Файлы из хранилища не должны кэшироваться общими кэшами в приватной зоне.
     if request.path.startswith("/private/"):
@@ -1299,6 +1270,100 @@ def xaccel_public_protected_response(rel_path, filename):
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     return response
+
+
+def send_file_response(path, attachment=False):
+    """Отдача файла: Range-стриминг (настраивается) либо whole-file send_file."""
+    if effective_stream_uploads():
+        return send_streamable(
+            path, download_name=os.path.basename(path), attachment=attachment)
+    return send_secure_file(path, attachment=attachment)
+
+
+# =====================================================================
+# RANGE-ЗАПРОСЫ (перемотка видео/аудио в браузере)
+# =====================================================================
+def parse_range_header(range_header, file_size):
+    """Разбирает HTTP Range ('bytes=a-b' / 'bytes=a-' / 'bytes=-N').
+
+    Возвращает (start, end) включительно либо None. Невалидные диапазоны
+    намеренно игнорируются — клиент получит весь файл (без 416).
+    """
+    if not range_header or not range_header.startswith("bytes="):
+        return None
+    spec = range_header[6:].split(",")[0].strip()
+    if "-" not in spec:
+        return None
+    start_s, _, end_s = spec.partition("-")
+    try:
+        if start_s == "":
+            if end_s == "":
+                return None
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start = max(0, file_size - n)
+            end = file_size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    if start > end or start >= file_size:
+        return None
+    return start, min(end, file_size - 1)
+
+
+def send_streamable(path, mimetype=None, download_name=None, attachment=False):
+    """Отдача файла с поддержкой Range: 206 Partial Content для срезов."""
+    file_size = os.path.getsize(path)
+    if mimetype is None:
+        import mimetypes
+        mimetype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    disposition = "attachment" if attachment else "inline"
+    if download_name:
+        headers["Content-Disposition"] = (
+            f"{disposition}; filename*=UTF-8''{quote(download_name)}")
+    if attachment or not is_safe_public_filename(os.path.basename(path)):
+        # скачивание / потенциально опасный тип — изолируем от XSS
+        headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+
+    rng = parse_range_header(request.headers.get("Range"), file_size)
+    if rng:
+        start, end = rng
+        length = end - start + 1
+
+        def reader():
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        headers["Content-Length"] = str(length)
+        return Response(reader(), status=206, mimetype=mimetype, headers=headers)
+
+    def full_reader():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    headers["Content-Length"] = str(file_size)
+    return Response(full_reader(), status=200, mimetype=mimetype, headers=headers)
 
 
 # =====================================================================
@@ -1517,14 +1582,19 @@ def account_change_password():
 @login_required
 def cloud():
     q = request.args.get("q", "").strip()[:200]
+    sort = request.args.get("sort", "new")
+    if sort not in SORT_OPTIONS:
+        sort = "new"
     username = session["user"]
     is_admin = session.get("is_admin", False)
 
-    public_files = list_files(zone="public", q=q)
+    public_files = list_files(zone="public", q=q, sort=sort)
     if is_admin:
-        private_files = list_files(zone="private", q=q)
+        private_files = list_files(zone="private", q=q, sort=sort)
     else:
-        private_files = list_files(private_username=secure_filename(username), q=q)
+        private_files = list_files(
+            private_username=secure_filename(username), q=q, sort=sort
+        )
 
     users = []
     if is_admin:
@@ -1545,6 +1615,7 @@ def cloud():
         users=users, q=q, usage=usage, quota_percent=quota_percent,
         user_quota=quota,
         max_file_size=effective_max_file_size(),
+        sort=sort, sort_options=SORT_OPTIONS,
     )
 
 
@@ -1593,6 +1664,84 @@ def cloud_purge_trash():
 # =====================================================================
 # ОБЛАКО: ЗАГРУЗКА
 # =====================================================================
+def store_uploaded_file(user_row, zone, safe_name, stream_factory, owner=None):
+    """Общая логика сохранения загруженного файла (для form- и JSON-API).
+
+    stream_factory() возвращает открытый binary file-like объект.
+    owner — владелец хранилища (для загрузки админом в private-зону другого
+    пользователя); по умолчанию — сам загружающий.
+    Возвращает dict с полями: name, size, url, full_url.
+    Бросает ValueError с человекочитаемым сообщением при ошибках валидации.
+    """
+    username = user_row["username"]
+    is_admin_user = bool(user_row["is_admin"])
+
+    if zone not in ("public", "private"):
+        raise ValueError("Неверная зона")
+    if not safe_name:
+        raise ValueError("Недопустимое имя файла")
+    if zone == "public" and not is_admin_user and not is_safe_public_filename(safe_name):
+        raise ValueError("Этот тип файла запрещён для публичной зоны обычным пользователям")
+
+    max_size = effective_max_file_size()
+    if zone == "public":
+        if not valid_username(username):
+            raise ValueError("Недопустимое имя пользователя")
+        base_dir = PUBLIC_DIR
+        if is_admin_user:
+            prefix = ""
+        else:
+            prefix = secure_filename(username)
+            ensure_dir(os.path.join(PUBLIC_DIR, prefix))
+        owner = username
+    else:
+        if owner is None:
+            owner = username
+        if not valid_username(owner):
+            raise ValueError("Недопустимое имя пользователя")
+        base_dir = PRIVATE_DIR
+        prefix = secure_filename(owner)
+        get_user_private_dir(owner)  # гарантирует существование каталога
+
+    remaining = None if is_admin_user else quota_remaining(owner)
+    if remaining is not None and remaining <= 0:
+        raise ValueError("Квота хранилища исчерпана")
+
+    rel_path = unique_rel_path(base_dir, prefix, safe_name, zone)
+    target_path = safe_storage_path(base_dir, rel_path)
+
+    stream = stream_factory()
+    try:
+        size = save_upload_stream(
+            stream, target_path,
+            max_size=max_size, quota_remaining=remaining,
+        )
+    except UploadTooLarge:
+        raise ValueError(f"Файл слишком большой (максимум {human_size(max_size)})")
+    except QuotaExceeded:
+        raise ValueError("Квота хранилища исчерпана")
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+    upsert_file_record(owner, zone, rel_path, safe_name, size)
+
+    if zone == "public":
+        url = f"/public/{quote(rel_path)}"
+    else:
+        username_part, filename_part = rel_path.split("/", 1)
+        url = f"/private/{quote(username_part)}/{quote(filename_part)}"
+
+    return {
+        "name": safe_name,
+        "size": size,
+        "url": url,
+        "full_url": PUBLIC_BASE_URL + url,
+    }
+
+
 @app.route("/cloud/upload", methods=["POST"])
 @login_required
 def cloud_upload():
@@ -1616,83 +1765,91 @@ def cloud_upload():
 
     is_admin = session.get("is_admin", False)
 
-    if zone == "private":
-        if is_admin:
-            target_user = request.form.get("target_user", session["user"]).strip()
-        else:
-            target_user = session["user"]
+    if zone == "private" and is_admin:
+        target_user = request.form.get("target_user", session["user"]).strip()
     else:
         target_user = session["user"]
 
-    if not valid_username(target_user):
-        flash("❌ Недопустимое имя пользователя")
-        return redirect(url_for("cloud"))
-
-    target_row = get_user_row(target_user)
-    if not target_row:
+    user_row = get_user_row(session["user"])
+    if not user_row:
         flash("❌ Пользователь не найден")
         return redirect(url_for("cloud"))
 
+    if zone == "private" and target_user != session["user"]:
+        # админ может загружать в private-зону другого пользователя
+        if not get_user_row(target_user):
+            flash("❌ Пользователь не найден")
+            return redirect(url_for("cloud"))
+
     safe_name = secure_filename(file.filename)
-    if not safe_name:
-        flash("❌ Недопустимое имя файла")
-        return redirect(url_for("cloud"))
-
-    if zone == "public" and not is_admin and not is_safe_public_filename(safe_name):
-        flash("❌ Этот тип файла запрещён для публичной зоны обычным пользователям")
-        return redirect(url_for("cloud"))
-
-    if zone == "public":
-        base_dir = PUBLIC_DIR
-        if is_admin:
-            prefix = ""
-            target_dir = PUBLIC_DIR
-            owner = session["user"]
-        else:
-            prefix = secure_filename(session["user"])
-            target_dir = os.path.join(PUBLIC_DIR, prefix)
-            ensure_dir(target_dir)
-            owner = session["user"]
-    else:
-        base_dir = PRIVATE_DIR
-        prefix = secure_filename(target_user)
-        target_dir = get_user_private_dir(target_user)
-        owner = target_user
-
-    owner_admin = is_admin_username(owner)
-    remaining = None if owner_admin else quota_remaining(owner)
-
-    if remaining is not None and remaining <= 0:
-        flash("❌ Квота хранилища исчерпана")
-        return redirect(url_for("cloud"))
-
-    rel_path = unique_rel_path(base_dir, prefix, safe_name, zone)
-    target_path = safe_storage_path(base_dir, rel_path)
 
     try:
-        size = save_upload_stream(
-            file.stream, target_path,
-            max_size=effective_max_file_size(), quota_remaining=remaining,
+        info = store_uploaded_file(
+            user_row, zone, safe_name, lambda: file.stream,
+            owner=target_user if zone == "private" else None,
         )
-    except UploadTooLarge:
-        flash(f"❌ Файл слишком большой (максимум {human_size(effective_max_file_size())})")
-        return redirect(url_for("cloud"))
-    except QuotaExceeded:
-        flash("❌ Квота хранилища исчерпана")
+    except ValueError as e:
+        flash(f"❌ {e}")
         return redirect(url_for("cloud"))
 
-    upsert_file_record(owner, zone, rel_path, safe_name, size)
-    audit("upload", f"{zone}:{rel_path}")
-
-    if zone == "public":
-        link = public_url(rel_path)
-    else:
-        username_part, filename_part = rel_path.split("/", 1)
-        link = private_url(username_part, filename_part)
-
+    audit("upload", f"{zone}:{info['url']}")
     flash(f"✅ Файл загружен: {safe_name}")
-    flash(f"🔗 Ссылка: {link}")
+    flash(f"🔗 Ссылка: {info['full_url']}")
     return redirect(url_for("cloud"))
+
+
+@app.route("/cloud/upload-multi", methods=["POST"])
+@login_required
+@limiter.limit("120 per minute")
+@csrf.exempt
+def cloud_upload_multi():
+    """Множественная загрузка через fetch (multipart с несколькими файлами).
+
+    Ответ всегда JSON: {"ok": [...], "errors": [...]}, HTTP 200/400.
+    """
+    # CSRF: маршрут исключён из глобальной проверки (токен может приходить
+    # в заголовке X-CSRFToken из fetch), поэтому проверяем вручную.
+    if not _manual_csrf_ok():
+        return jsonify(ok=[], errors=["Сессия устарела, обнови страницу"]), 400
+
+    files = request.files.getlist("files") or request.files.getlist("file")
+    if not files or all(f.filename == "" for f in files):
+        return jsonify(ok=[], errors=["Файлы не выбраны"]), 400
+
+    zone = request.form.get("zone", "private")
+    user_row = get_user_row(session["user"])
+    if not user_row:
+        return jsonify(ok=[], errors=["Пользователь не найден"]), 400
+
+    max_size = effective_max_file_size()
+    ok_list, errors = [], []
+
+    for f in files:
+        if not f.filename:
+            continue
+        safe_name = secure_filename(f.filename)
+        if not safe_name:
+            errors.append(f"{f.filename}: недопустимое имя файла")
+            continue
+        try:
+            # save_upload_stream читает file.stream напрямую; повторное
+            # использование одного stream между файлами невозможно — Flask
+            # даёт отдельный FileStorage на каждый файл, поэтому ок.
+            info = store_uploaded_file(
+                user_row, zone, safe_name, lambda f=f: f.stream
+            )
+        except ValueError as e:
+            errors.append(f"{f.filename}: {e}")
+            continue
+        ok_list.append(info)
+
+    if ok_list:
+        audit(
+            "upload_multi",
+            "; ".join(f"{zone}:{i['url']}" for i in ok_list)[:500],
+        )
+    status = 200 if ok_list and not errors else (207 if ok_list else 400)
+    return jsonify(ok=ok_list, errors=errors), status
 
 
 # =====================================================================
@@ -1722,16 +1879,12 @@ def upload_big(token):
     if not user_row:
         return "❌ Пользователь не найден", 403
 
-    user_admin = bool(user_row["is_admin"])
 
     if request.method == "GET":
         return render_template("upload_big.html", token=token, user=username)
 
     if "file" not in request.files or request.files["file"].filename == "":
         return "❌ Файл не выбран", 400
-
-    if request.content_length and request.content_length > MAX_FILE_SIZE:
-        return "❌ Файл больше 4 ГБ", 413
 
     file = request.files["file"]
     zone = request.form.get("zone", "private")
@@ -1742,48 +1895,19 @@ def upload_big(token):
     if not safe_name:
         return "❌ Недопустимое имя файла", 400
 
-    if zone == "public" and not user_admin and not is_safe_public_filename(safe_name):
-        return "❌ Этот тип файла запрещён для публичной зоны обычным пользователям", 400
-
-    if zone == "private":
-        base_dir = PRIVATE_DIR
-        prefix = secure_filename(username)
-        target_dir = get_user_private_dir(username)
-        owner = username
-    else:
-        base_dir = PUBLIC_DIR
-        if user_admin:
-            prefix = ""
-            target_dir = PUBLIC_DIR
-        else:
-            prefix = secure_filename(username)
-            target_dir = os.path.join(PUBLIC_DIR, prefix)
-            ensure_dir(target_dir)
-        owner = username
-
-    remaining = None if user_admin else quota_remaining(owner)
-    if remaining is not None and remaining <= 0:
-        return "❌ Квота хранилища исчерпана", 413
-
-    rel_path = unique_rel_path(base_dir, prefix, safe_name, zone)
-    target_path = safe_storage_path(base_dir, rel_path)
-
     try:
-        size = save_upload_stream(
-            file.stream, target_path,
-            max_size=MAX_FILE_SIZE, quota_remaining=remaining,
-        )
-    except UploadTooLarge:
-        return "❌ Файл больше 4 ГБ", 413
-    except QuotaExceeded:
-        return "❌ Квота хранилища исчерпана", 413
+        info = store_uploaded_file(user_row, zone, safe_name, lambda: file.stream)
+    except ValueError as e:
+        msg = str(e)
+        # 413 — для квоты/размера, 400 — для остальных ошибок валидации
+        status = 413 if ("Квота" in msg or "слишком большой" in msg) else 400
+        return f"❌ {msg}", status
 
-    upsert_file_record(owner, zone, rel_path, safe_name, size)
     try:
         db = get_db()
         db.execute(
             "INSERT INTO audit_log (username, action, details, ip) VALUES (?,?,?,?)",
-            (username, "upload_big", f"{zone}:{rel_path}", request.remote_addr),
+            (username, "upload_big", f"{zone}:{info['url']}", request.remote_addr),
         )
         db.commit()
     except Exception:
@@ -1860,7 +1984,7 @@ def private_file(username, filename):
     filename_base = os.path.basename(path)
     if USE_X_ACCEL:
         return xaccel_private_response(rel_path, filename_base)
-    return send_secure_file(path, attachment=True)
+    return send_file_response(path, attachment=True)
 
 
 # =====================================================================
@@ -1875,7 +1999,7 @@ def public_file(rel_path):
     if row:
         increment_download(row["id"])
     attachment = not is_safe_public_filename(os.path.basename(path))
-    return send_secure_file(path, attachment=attachment)
+    return send_file_response(path, attachment=attachment)
 
 
 # =====================================================================
@@ -1902,7 +2026,7 @@ def share_download(token):
         if row["zone"] == "private":
             return xaccel_private_response(row["rel_path"], filename_base)
         return xaccel_public_protected_response(row["rel_path"], filename_base)
-    return send_secure_file(path, attachment=True)
+    return send_file_response(path, attachment=True)
 
 
 # =====================================================================
@@ -1972,6 +2096,277 @@ def del_user(uid):
     audit("user_deleted", username)
     flash(f"🗑️ Пользователь {username} удалён, его файлы перемещены в корзину")
     return redirect(url_for("index"))
+
+
+# =====================================================================
+# 💾 АДМИН: РЕЗЕРВНАЯ КОПИЯ (users.db + список файлов хранилища)
+# =====================================================================
+BACKUP_MAX_DB_BYTES = 200 * 1024 * 1024  # не отдаём дампы больше 200 МБ
+
+
+@app.route("/admin/backup")
+@admin_required
+@limiter.limit("6 per hour")
+def admin_backup():
+    """Скачивание tar.gz: консистентный дамп SQLite + манифест хранилища.
+
+    Сами файлы хранилища в архив не кладутся (могут быть ГБ) — вместо них
+    manifest.txt с путями/размерами, чтобы сверить целостность после restore.
+    Для полного бэкапа на сервере используйте deploy/backup.sh + rsync.
+    """
+    import sqlite3
+    import tarfile
+    import tempfile
+
+    # читаем через globals(): тесты monkeypatch-ят BACKUP_MAX_DB_BYTES в app
+    if os.path.getsize(DB) > globals()["BACKUP_MAX_DB_BYTES"]:
+        abort(413, description="Слишком большая БД для скачивания из веба")
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".tar.gz", prefix="goosko-backup-")
+    os.close(fd)
+    try:
+        dump_path = tmp_path + ".db"
+        src = sqlite3.connect(DB, timeout=15)
+        dst = sqlite3.connect(dump_path)
+        try:
+            src.backup(dst)  # горячий консистентный дамп (WAL-safe)
+        finally:
+            dst.close()
+            src.close()
+
+        # манифест хранилища
+        manifest_lines = []
+        for zone_dir in (PRIVATE_DIR, PUBLIC_DIR):
+            for root, _dirs, files in os.walk(zone_dir):
+                for fname in sorted(files):
+                    full = os.path.join(root, fname)
+                    try:
+                        st = os.stat(full)
+                    except OSError:
+                        continue
+                    rel = os.path.relpath(full, STORAGE_DIR)
+                    manifest_lines.append(f"{rel}\t{st.st_size}\t{int(st.st_mtime)}")
+        manifest_path = tmp_path + ".manifest.txt"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(manifest_lines))
+
+        stamp = utcnow().strftime("%Y%m%d_%H%M%S")
+        out_name = f"goosko-backup_{stamp}.tar.gz"
+        with tarfile.open(tmp_path, "w:gz") as tf:
+            tf.add(dump_path, arcname="users.db")
+            tf.add(manifest_path, arcname="storage_manifest.txt")
+            readme = (
+                "Goosko-online backup.\n"
+                "Restore users.db поверх рабочей копии (сервис должен быть остановлен).\n"
+                "storage_manifest.txt — список файлов хранилища (путь\\tразмер\\tmtime) "
+                "для сверки; сами файлы копируйте с сервера (deploy/backup.sh).\n"
+            ).encode("utf-8")
+            info = tarfile.TarInfo("README.txt")
+            info.size = len(readme)
+            import io as _io
+            tf.addfile(info, _io.BytesIO(readme))
+        os.remove(dump_path)
+        os.remove(manifest_path)
+
+        audit("backup_downloaded", out_name)
+
+        def _cleanup_tmp(path=tmp_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        atexit.register(_cleanup_tmp)  # файл нужен до отправки ответа
+
+        return send_file(
+            tmp_path, as_attachment=True, download_name=out_name,
+            mimetype="application/gzip", conditional=False,
+        )
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+# =====================================================================
+# ⚙️ АДМИН: НАСТРОЙКИ СИСТЕМЫ
+# =====================================================================
+EDITABLE_SETTINGS = {
+    # key: (метка, мин, макс, функция применения к человеку)
+    "user_quota_bytes": ("Квота пользователя (байт)", 1024 ** 2, 1024 ** 5, False),
+    "max_file_size_bytes": ("Макс. размер файла (байт)", 1024, 1024 ** 4, False),
+    "share_ttl_hours": ("Время жизни ссылки (часы)", 1, 24 * 90, False),
+    "trash_retention_days": ("Хранение в корзине (дни)", 0, 365, False),
+    "camera_max_video_seconds": ("Макс. длина видео с камеры (сек)", 1, 600, False),
+    "camera_preview_enabled": (
+        "Живое превью камеры на стр. Быстрого доступа (1=вкл, 0=выкл)", 0, 1, True),
+    "stream_uploads": (
+        "Потоковая отдача файлов с Range (1=вкл, 0=выкл)", 0, 1, True),
+}
+
+
+@app.route("/admin/settings")
+@admin_required
+def admin_settings_page():
+    rows = []
+    for key, (label, lo, hi, is_flag) in EDITABLE_SETTINGS.items():
+        value = get_int_setting(key, None)
+        rows.append({
+            "key": key, "label": label, "min": lo, "max": hi,
+            "value": value if value is not None else lo,
+            "is_flag": is_flag,
+        })
+    return render_template("settings.html", rows=rows)
+
+
+@app.route("/admin/settings", methods=["POST"])
+@admin_required
+@limiter.limit("30 per minute")
+def admin_settings_save():
+    db = get_db()
+    changed = []
+    errors = []
+    for key, (label, lo, hi, _is_flag) in EDITABLE_SETTINGS.items():
+        raw = request.form.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            errors.append(f"{label}: не число")
+            continue
+        if not (lo <= value <= hi):
+            errors.append(f"{label}: значение вне диапазона {lo}–{hi}")
+            continue
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        changed.append(f"{key}={value}")
+    db.commit()
+    if changed:
+        audit("settings_changed", "; ".join(changed))
+    for err in errors:
+        flash(f"❌ {err}")
+    if changed and not errors:
+        flash("✅ Настройки сохранены")
+    elif not changed and not errors:
+        flash("ℹ️ Изменений не найдено")
+    return redirect(url_for("admin_settings_page"))
+
+
+# =====================================================================
+# 📜 АДМИН: ЖУРНАЛ СОБЫТИЙ
+# =====================================================================
+AUDIT_ACTIONS = [
+    "", "login_failed", "login", "logout", "password_changed",
+    "file_uploaded", "upload", "upload_multi", "file_big_uploaded", "upload_big",
+    "file_deleted", "file_restored",
+    "file_purged", "trash_purged", "share_created", "download",
+    "user_added", "user_deleted", "settings_changed", "backup_downloaded",
+    "ssh_cert_issued", "ssh_cert_revoked", "ssh_bundle_downloaded",
+    "quick_photo", "quick_video", "quick_video_started", "quick_screenshot",
+    "quick_media_deleted", "quick_media_purged", "power_action",
+]
+
+
+@app.route("/admin/log")
+@admin_required
+def admin_log_page():
+    q = request.args.get("q", "").strip()[:100]
+    action = request.args.get("action", "").strip()[:40]
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
+    per_page = 50
+
+    sql = "SELECT * FROM audit_log"
+    conds, params = [], []
+    if action in AUDIT_ACTIONS and action:
+        conds.append("action = ?")
+        params.append(action)
+    if q:
+        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        conds.append("(username LIKE ? ESCAPE '\\' OR details LIKE ? ESCAPE '\\' OR ip LIKE ? ESCAPE '\\')")
+        like = f"%{escaped}%"
+        params += [like, like, like]
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+
+    total = get_db().execute(
+        "SELECT COUNT(*) FROM audit_log"
+        + (" WHERE " + " AND ".join(conds) if conds else ""),
+        params,
+    ).fetchone()[0]
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, pages)
+    rows = get_db().execute(
+        sql + " ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [per_page, (page - 1) * per_page],
+    ).fetchall()
+
+    return render_template(
+        "log.html", rows=rows, q=q, action=action,
+        page=page, pages=pages, total=total,
+        actions=[a for a in AUDIT_ACTIONS if a],
+    )
+
+
+@app.route("/admin/log/export")
+@admin_required
+def admin_log_export():
+    """Выгрузка журнала в CSV (для разбора инцидентов)."""
+    import csv
+    import io
+    rows = get_db().execute(
+        "SELECT created_at, username, action, details, ip "
+        "FROM audit_log ORDER BY id DESC LIMIT 10000"
+    ).fetchall()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["created_at", "username", "action", "details", "ip"])
+    for r in rows:
+        writer.writerow([r[0], r[1], r[2], r[3], r[4]])
+    data = buf.getvalue().encode("utf-8-sig")  # BOM для Excel
+    return Response(
+        data, mimetype="text/csv",
+        headers={
+            "Content-Disposition":
+                f"attachment; filename*=UTF-8''{quote('audit_log.csv')}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.route("/admin/log/clear", methods=["POST"])
+@admin_required
+def admin_log_clear():
+    """Очистка журнала старше N дней (по умолчанию 90)."""
+    try:
+        days = max(0, int(request.form.get("days", 90)))
+    except ValueError:
+        days = 90
+    db = get_db()
+    if days == 0:
+        n = db.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+        db.execute("DELETE FROM audit_log")
+    else:
+        n = db.execute(
+            "SELECT COUNT(*) FROM audit_log "
+            "WHERE created_at < datetime('now', ?)",
+            (f"-{days} days",),
+        ).fetchone()[0]
+        db.execute(
+            "DELETE FROM audit_log WHERE created_at < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+    db.commit()
+    audit("log_cleared", f"удалено записей: {n} (старше {days} дн.)")
+    flash(f"🧹 Журнал очищен: удалено {n} записей")
+    return redirect(url_for("admin_log_page"))
 
 
 # =====================================================================
@@ -2091,170 +2486,6 @@ def ssh_revoke(cert_id):
     else:
         flash("❌ Не удалось отозвать сертификат")
     return redirect(url_for("ssh_page"))
-
-
-# =====================================================================
-# ⚡ БЫСТРЫЙ ДОСТУП (только администраторы)
-# =====================================================================
-@app.route("/quick")
-@admin_required
-def quick_access_page():
-    media = []
-    try:
-        for p in sorted(MEDIA_DIR.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if p.is_file() and MEDIA_ID_RE.fullmatch(p.name):
-                kind = "Фото" if p.name.startswith("cam_photo") else \
-                       "Видео" if p.name.startswith("cam_video") else "Скриншот"
-                media.append({
-                    "id": p.name,
-                    "kind": kind,
-                    "size": p.stat().st_size,
-                    "mtime": datetime.fromtimestamp(p.stat().st_mtime).strftime("%d.%m.%Y %H:%M"),
-                })
-            if len(media) >= 100:
-                break
-    except OSError:
-        app.logger.exception("Failed to list media dir")
-
-    return render_template(
-        "quick.html",
-        config=QUICK_ACCESS_CONFIG,
-        media=media,
-        max_video_seconds=CAMERA_VIDEO_MAX_SECONDS,
-        photo_ttl_hours=CAMERA_PHOTO_TTL // 3600,
-        confirm_phrase=POWER_CONFIRM_PHRASE,
-    )
-
-
-def _list_media_ids():
-    ids = []
-    try:
-        for p in MEDIA_DIR.iterdir():
-            if p.is_file() and MEDIA_ID_RE.fullmatch(p.name):
-                ids.append(p.name)
-    except OSError:
-        pass
-    return ids
-
-
-@app.route("/quick/capture/photo", methods=["POST"])
-@admin_required
-@limiter.limit("20 per hour")
-def quick_capture_photo():
-    cleanup_media_files()
-    ok, info = capture_photo(QUICK_ACCESS_CONFIG)
-    if ok:
-        audit("quick_photo", os.path.basename(info))
-        flash(f"✅ Фото снято: {os.path.basename(info)}")
-    else:
-        flash(f"❌ Не удалось сделать фото: {info[:300]}")
-    return redirect(url_for("quick_access_page"))
-
-
-@app.route("/quick/capture/video", methods=["POST"])
-@admin_required
-@limiter.limit("10 per hour")
-def quick_capture_video():
-    try:
-        duration = int(request.form.get("duration", 10))
-    except (TypeError, ValueError):
-        duration = 0
-    if not (1 <= duration <= CAMERA_VIDEO_MAX_SECONDS):
-        flash(f"❌ Длительность: от 1 до {CAMERA_VIDEO_MAX_SECONDS} секунд")
-        return redirect(url_for("quick_access_page"))
-
-    cleanup_media_files()
-    ok, info = capture_video(QUICK_ACCESS_CONFIG, duration)
-    if ok:
-        audit("quick_video", f"{os.path.basename(info)} ({duration}s)")
-        flash(f"✅ Видео записано ({duration} с): {os.path.basename(info)}")
-    else:
-        flash(f"❌ Не удалось записать видео: {info[:300]}")
-    return redirect(url_for("quick_access_page"))
-
-
-@app.route("/quick/capture/screenshot", methods=["POST"])
-@admin_required
-@limiter.limit("30 per hour")
-def quick_capture_screenshot():
-    cleanup_media_files()
-    ok, info = capture_screenshot(QUICK_ACCESS_CONFIG)
-    if ok:
-        audit("quick_screenshot", os.path.basename(info))
-        flash(f"✅ Скриншот сделан: {os.path.basename(info)}")
-    else:
-        flash(f"❌ Не удалось сделать скриншот: {info[:300]}")
-    return redirect(url_for("quick_access_page"))
-
-
-@app.route("/quick/media/<media_id>")
-@admin_required
-def quick_media_view(media_id):
-    path = resolve_media_file(media_id)
-    if path is None:
-        abort(404)
-    mimetype = {
-        ".jpg": "image/jpeg", ".png": "image/png", ".mp4": "video/mp4",
-    }.get(os.path.splitext(media_id)[1].lower())
-    resp = send_file(path, mimetype=mimetype, conditional=True)
-    resp.headers["Cache-Control"] = "private, no-store"
-    resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
-    return resp
-
-
-@app.route("/quick/delete", methods=["POST"])
-@admin_required
-def quick_delete_media():
-    media_id = request.form.get("id", "")
-    path = resolve_media_file(media_id)
-    if path is None:
-        flash("❌ Файл не найден")
-    else:
-        try:
-            os.remove(path)
-            audit("quick_media_deleted", media_id)
-            flash(f"🗑️ Удалено: {media_id}")
-        except OSError:
-            flash("❌ Не удалось удалить файл")
-    return redirect(url_for("quick_access_page"))
-
-
-@app.route("/quick/purge", methods=["POST"])
-@admin_required
-def quick_purge_media():
-    n = 0
-    for name in _list_media_ids():
-        try:
-            (MEDIA_DIR / name).unlink()
-            n += 1
-        except OSError:
-            app.logger.exception("Failed to purge media %s", name)
-    audit("quick_media_purged", f"{n} files")
-    flash(f"🧹 Удалено медиафайлов: {n}")
-    return redirect(url_for("quick_access_page"))
-
-
-@app.route("/quick/power/<action>", methods=["POST"])
-@admin_required
-@limiter.limit("5 per hour")
-def quick_power(action):
-    if action not in POWER_ACTIONS:
-        abort(404)
-    cmd, message = POWER_ACTIONS[action]
-
-    # Обязательное подтверждение фразой — защита от случайного/CSRF выключения.
-    if request.form.get("confirm", "").strip() != POWER_CONFIRM_PHRASE:
-        flash(f"❌ Для подтверждения введите фразу «{POWER_CONFIRM_PHRASE}»")
-        return redirect(url_for("quick_access_page"))
-
-    audit(f"quick_{action}", "requested")
-    ok, _, err = run_cmd(cmd, timeout=15)
-    if ok:
-        flash(message)
-        # Страница после выключения будет недоступна — редиректим на логин.
-        return redirect(url_for("index"))
-    flash(f"❌ Не удалось выполнить команду: {err.strip()[:300]}")
-    return redirect(url_for("quick_access_page"))
 
 
 # =====================================================================

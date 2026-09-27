@@ -24,9 +24,9 @@
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
             <label class="file-drop" data-file-drop>
-                <span>Перетащи файл сюда или нажми для выбора</span>
-                <input type="file" name="file" required>
-                <span class="muted" data-file-name>Файл не выбран</span>
+                <span>Перетащи файлы сюда или нажми для выбора (можно несколько)</span>
+                <input type="file" name="file" multiple required>
+                <span class="muted" data-file-name>Файлы не выбраны</span>
             </label>
 
             <label class="field radio">
@@ -89,6 +89,15 @@
             <label class="field">
                 Поиск файлов
                 <input type="search" name="q" value="{{ q }}" placeholder="Имя файла">
+            </label>
+
+            <label class="field">
+                Сортировка
+                <select name="sort">
+                    {% for key, (sql, label) in sort_options.items() %}
+                        <option value="{{ key }}" {% if key == sort %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
             </label>
 
             <button class="btn" type="submit">Найти</button>

@@ -1,0 +1,46 @@
+[Unit]
+Description=GOOSKO Online (Flask web app)
+After=network.target
+
+[Service]
+Type=exec
+User=goosko
+Group=www-data
+WorkingDirectory=/opt/goosko-online
+
+# Загрузка секретов и путей (SECRET_KEY, ADMIN_PASSWORD только при первой
+# инициализации, FUNNEL_HOST, PUBLIC_BASE_URL, CAMERA_DEVICE и т.д.)
+EnvironmentFile=/etc/goosko/goosko.env
+
+# 2 воркера достаточно для внутренней системы; timeout=180 — потому что
+# запись видео с камеры (до 120 с) блокирует воркер на всё время записи.
+ExecStart=/opt/goosko-venv/bin/gunicorn \
+    --workers 2 \
+    --threads 4 \
+    --timeout 180 \
+    --graceful-timeout 30 \
+    --keep-alive 5 \
+    --bind 127.0.0.1:5000 \
+    --access-logfile - \
+    --error-logfile - \
+    app:app
+
+Restart=on-failure
+RestartSec=3
+
+# Жёсткие ограничения безопасности systemd
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/www/storage /opt/goosko-online/users.db
+CacheDirectory=goosko
+StateDirectory=goosko
+UMask=0027
+
+# Фоновая автоочистка корзины/медиа запущена внутри процесса
+TimeoutStopSec=20
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

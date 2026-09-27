@@ -10,11 +10,22 @@
     Медиафайлы хранятся на сервере и автоматически удаляются через {{ photo_ttl_hours }} ч.
 </p>
 
+{% if preview_enabled %}
+<div class="card">
+    <h2>🔴 Живое превью камеры</h2>
+    <img id="cam-preview" alt="Превью с камеры"
+         style="max-width:100%;border-radius:8px;background:#111;"
+         src="{{ url_for('quick_access.quick_camera_stream') }}">
+    <p class="muted">Поток автоматически останавливается через 10 минут.
+        Отключается в админских настройках (<code>camera_preview_enabled</code>).</p>
+</div>
+{% endif %}
+
 <div class="grid two">
     <div class="card">
         <h2>📷 Фото с камеры</h2>
         <p>Один кадр с веб-камеры сервера.</p>
-        <form method="post" action="{{ url_for('quick_capture_photo') }}">
+        <form method="post" action="{{ url_for('quick_access.quick_capture_photo') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn primary" type="submit">📸 Сделать фото</button>
         </form>
@@ -22,7 +33,7 @@
 
     <div class="card">
         <h2>🎥 Видео с камеры</h2>
-        <form method="post" action="{{ url_for('quick_capture_video') }}">
+        <form method="post" action="{{ url_for('quick_access.quick_capture_video') }}" id="video-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label class="field">
                 Длительность (секунды, 1–{{ max_video_seconds }})
@@ -30,12 +41,13 @@
             </label>
             <button class="btn primary" type="submit">🎬 Записать видео</button>
         </form>
+        <p class="muted" id="video-status" hidden></p>
     </div>
 
     <div class="card">
         <h2>🖥️ Скриншот экрана</h2>
         <p>Снимок рабочего стола сервера (<code>{{ config.screen_device }}</code>).</p>
-        <form method="post" action="{{ url_for('quick_capture_screenshot') }}">
+        <form method="post" action="{{ url_for('quick_access.quick_capture_screenshot') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn primary" type="submit">🖼️ Сделать скриншот</button>
         </form>
@@ -46,14 +58,14 @@
         <p class="muted">Опасные действия. Для выполнения введите фразу
             <code>{{ confirm_phrase }}</code> — это защита от случайного нажатия.</p>
 
-        <form method="post" action="{{ url_for('quick_power', action='reboot') }}"
+        <form method="post" action="{{ url_for('quick_access.quick_power', action='reboot') }}"
               data-confirm-power="{{ confirm_phrase }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="field" type="text" name="confirm" placeholder="Введите: {{ confirm_phrase }}" autocomplete="off" required>
             <button class="btn warn" type="submit">♻️ Перезагрузить</button>
         </form>
 
-        <form method="post" action="{{ url_for('quick_power', action='shutdown') }}"
+        <form method="post" action="{{ url_for('quick_access.quick_power', action='shutdown') }}"
               data-confirm-power="{{ confirm_phrase }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="field" type="text" name="confirm" placeholder="Введите: {{ confirm_phrase }}" autocomplete="off" required>
@@ -81,12 +93,22 @@
                 {% for m in media %}
                 <tr>
                     <td>{{ m.kind }}</td>
-                    <td><code>{{ m.id }}</code></td>
+                    <td class="media-cell">
+                        {% if m.thumb %}
+                        <a href="{{ url_for('quick_access.quick_media_view', media_id=m.id) }}"
+                           target="_blank" rel="noopener">
+                            <img src="{{ url_for('quick_access.quick_media_view', media_id=m.id) }}"
+                                 alt="{{ m.id }}" loading="lazy"
+                                 style="max-height:72px;max-width:160px;border-radius:6px;display:block;">
+                        </a>
+                        {% endif %}
+                        <code>{{ m.id }}</code>
+                    </td>
                     <td>{{ m.size | human_size }}</td>
                     <td>{{ m.mtime }}</td>
                     <td class="file-actions">
-                        <a class="btn small" href="{{ url_for('quick_media_view', media_id=m.id) }}" target="_blank" rel="noopener">Открыть</a>
-                        <form method="post" action="{{ url_for('quick_delete_media') }}" class="inline-form">
+                        <a class="btn small" href="{{ url_for('quick_access.quick_media_view', media_id=m.id) }}" target="_blank" rel="noopener">Открыть</a>
+                        <form method="post" action="{{ url_for('quick_access.quick_delete_media') }}" class="inline-form">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <input type="hidden" name="id" value="{{ m.id }}">
                             <button class="btn small danger" type="submit">Удалить</button>
@@ -98,7 +120,7 @@
         </table>
     </div>
 
-    <form method="post" action="{{ url_for('quick_purge_media') }}" class="inline-form">
+    <form method="post" action="{{ url_for('quick_access.quick_purge_media') }}" class="inline-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="btn danger" type="submit">🧹 Очистить всё</button>
     </form>
@@ -106,4 +128,53 @@
     <p class="muted">Пока пусто — сделайте фото, видео или скриншот.</p>
     {% endif %}
 </div>
+
+<script>
+(function () {
+    var form = document.getElementById("video-form");
+    var status = document.getElementById("video-status");
+    if (!form || !status) return;
+
+    function poll(taskId, startedAt) {
+        fetch("/quick/task/" + taskId, {credentials: "same-origin"})
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+                if (!data) { setTimeout(function () { poll(taskId, startedAt); }, 2000); return; }
+                if (data.status === "running") {
+                    var left = Math.max(0, data.duration - Math.floor((Date.now() - startedAt) / 1000));
+                    status.textContent = "⏳ Идёт запись… осталось ~" + left + " с";
+                    setTimeout(function () { poll(taskId, startedAt); }, 1500);
+                } else if (data.status === "done") {
+                    status.textContent = "✅ Видео готово: " + data.filename;
+                    location.reload();
+                } else {
+                    status.hidden = false;
+                    status.textContent = "❌ Ошибка записи: " + (data.error || "неизвестно");
+                }
+            })
+            .catch(function () { setTimeout(function () { poll(taskId, startedAt); }, 3000); });
+    }
+
+    form.addEventListener("submit", function (ev) {
+        ev.preventDefault();
+        var body = new FormData(form);
+        status.hidden = false;
+        status.textContent = "⏳ Запускаю запись…";
+        fetch(form.action, {
+            method: "POST",
+            headers: {"Accept": "application/json"},
+            body: body,
+            credentials: "same-origin"
+        }).then(function (r) { return r.json(); })
+          .then(function (data) {
+              if (data && data.task_id) {
+                  poll(data.task_id, Date.now());
+              } else {
+                  status.textContent = "❌ Не удалось начать запись";
+              }
+          })
+          .catch(function () { form.submit(); });
+    });
+})();
+</script>
 {% endblock %}

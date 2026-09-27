@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block title %}Настройки | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>⚙️ Настройки системы</h1>
+<p class="muted">Значения применяются сразу, без перезапуска сервера.</p>
+
+<div class="card">
+    <form method="post" action="{{ url_for('admin_settings_save') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        {% for row in rows %}
+            <label class="field">
+                {{ row.label }}
+                {% if row.is_flag %}
+                    <select name="{{ row.key }}">
+                        <option value="1" {% if row.value == 1 %}selected{% endif %}>Включено</option>
+                        <option value="0" {% if row.value == 0 %}selected{% endif %}>Выключено</option>
+                    </select>
+                {% else %}
+                    <input type="number" name="{{ row.key }}" value="{{ row.value }}"
+                           min="{{ row.min }}" max="{{ row.max }}" step="1" required>
+                {% endif %}
+                <small class="muted">Допустимо: {{ row.min }}–{{ row.max }}</small>
+            </label>
+        {% endfor %}
+
+        <button class="btn primary" type="submit">💾 Сохранить</button>
+    </form>
+</div>
+
+<a class="btn" href="/">← Назад в панель</a>
+{% endblock %}

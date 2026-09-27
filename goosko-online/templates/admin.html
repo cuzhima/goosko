@@ -24,6 +24,24 @@
         <p>Файловое хранилище.</p>
         <a class="btn primary" href="/cloud">Открыть облако</a>
     </div>
+
+    <div class="card">
+        <h2>⚙️ Настройки</h2>
+        <p>Квоты, лимиты файлов, корзина, стриминг.</p>
+        <a class="btn" href="{{ url_for('admin_settings_page') }}">Открыть</a>
+    </div>
+
+    <div class="card">
+        <h2>📜 Журнал событий</h2>
+        <p>Кто что делал: входы, файлы, настройки.</p>
+        <a class="btn" href="{{ url_for('admin_log_page') }}">Открыть</a>
+    </div>
+
+    <div class="card">
+        <h2>💾 Резервная копия</h2>
+        <p>Скачать дамп БД и манифест хранилища (tar.gz).</p>
+        <a class="btn" href="{{ url_for('admin_backup') }}">Скачать</a>
+    </div>
 </div>
 
 <div class="grid two">

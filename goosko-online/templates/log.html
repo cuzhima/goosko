@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Журнал событий | ГОО СКО{% endblock %}
+
+{% block content %}
+<h1>📜 Журнал событий</h1>
+<p class="muted">Всего записей: {{ total }}{% if q or action %} (фильтр){% endif %}</p>
+
+<div class="card">
+    <form class="search-form" method="get" action="{{ url_for('admin_log_page') }}">
+        <select name="action">
+            <option value="">Все события</option>
+            {% for a in actions %}
+                <option value="{{ a }}" {% if a == action %}selected{% endif %}>{{ a }}</option>
+            {% endfor %}
+        </select>
+        <input name="q" value="{{ q }}" placeholder="Логин, детали или IP…" maxlength="100">
+        <button class="btn" type="submit">🔍 Найти</button>
+        <a class="btn" href="{{ url_for('admin_log_export') }}">⬇️ CSV</a>
+    </form>
+</div>
+
+<div class="card">
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Дата (UTC)</th>
+                    <th>Пользователь</th>
+                    <th>Событие</th>
+                    <th>Детали</th>
+                    <th>IP</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in rows %}
+                <tr>
+                    <td>{{ r.created_at }}</td>
+                    <td>{{ r.username or '—' }}</td>
+                    <td><span class="badge">{{ r.action }}</span></td>
+                    <td>{{ r.details or '' }}</td>
+                    <td>{{ r.ip or '—' }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="5" class="muted">Записей нет</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if pages > 1 %}
+    <p>
+        {% if page > 1 %}<a class="btn small" href="{{ url_for('admin_log_page', q=q, action=action, page=page-1) }}">← Назад</a>{% endif %}
+        <span class="muted">стр. {{ page }} из {{ pages }}</span>
+        {% if page < pages %}<a class="btn small" href="{{ url_for('admin_log_page', q=q, action=action, page=page+1) }}">Вперёд →</a>{% endif %}
+    </p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>🧹 Очистка журнала</h2>
+    <form method="post" action="{{ url_for('admin_log_clear') }}"
+          data-confirm="Удалить старые записи журнала?">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label class="field">
+            Удалить записи старше (дней; 0 = весь журнал)
+            <input type="number" name="days" value="90" min="0" max="3650" step="1">
+        </label>
+        <button class="btn danger" type="submit">Очистить</button>
+    </form>
+</div>
+
+<a class="btn" href="/">← Назад в панель</a>
+{% endblock %}
