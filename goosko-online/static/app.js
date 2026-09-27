@@ -28,6 +28,21 @@ function initProgressBars() {
 document.addEventListener("DOMContentLoaded", () => {
     initProgressBars();
 
+    // Переключатель тёмной темы (выбор сохраняется в localStorage)
+    const themeBtn = document.getElementById("theme-toggle");
+    if (themeBtn) {
+        const syncLabel = () => {
+            themeBtn.textContent =
+                document.documentElement.classList.contains("dark") ? "☀️" : "🌙";
+        };
+        themeBtn.addEventListener("click", () => {
+            const dark = document.documentElement.classList.toggle("dark");
+            try { localStorage.setItem("theme", dark ? "dark" : "light"); } catch (e) {}
+            syncLabel();
+        });
+        syncLabel();
+    }
+
     // Копирование в буфер обмена
     document.addEventListener("click", async (event) => {
         const button = event.target.closest("[data-copy]");

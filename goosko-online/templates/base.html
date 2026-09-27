@@ -5,6 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}ГОО СКО{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+    <script>
+        // Тёмная тема: применяем до отрисовки, чтобы не было "белой вспышки".
+        try {
+            var t = localStorage.getItem("theme");
+            if (t === "dark" || (!t && window.matchMedia("(prefers-color-scheme: dark)").matches)) {
+                document.documentElement.classList.add("dark");
+            }
+        } catch (e) {}
+    </script>
 </head>
 <body>
     <a class="skip-link" href="#main">Перейти к содержимому</a>
@@ -14,6 +23,8 @@
             <a class="brand" href="/">ГОО СКО</a>
 
             <nav class="nav">
+                <button type="button" class="btn small" id="theme-toggle"
+                        aria-label="Переключить тёмную тему" title="Тёмная/светлая тема">🌓</button>
                 {% if session.get('user') %}
                     <a href="/">Панель</a>
                     <a href="/cloud">Облако</a>

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
+from flask.helpers import stream_with_context
 
 
 # =====================================================================
@@ -288,6 +289,14 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active
             ON files(zone, rel_path) WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner);
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'running',
+            filename TEXT,
+            error TEXT,
+            duration INTEGER,
+            started_at REAL NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_files_zone ON files(zone);
     """)
 
@@ -309,6 +318,18 @@ def init_db():
         "UPDATE files SET created_ms = strftime('%s', created_at) * 1000 "
         "WHERE created_ms IS NULL AND created_at IS NOT NULL"
     )
+
+    # Миграция старых БД: таблица задач быстрой видеосъёмки.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'running',
+            filename TEXT,
+            error TEXT,
+            duration INTEGER,
+            started_at REAL NOT NULL
+        )
+    """)
 
     if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         admin_password = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(16)
@@ -383,6 +404,11 @@ def effective_stream_uploads():
 def effective_camera_max_video_seconds():
     return max(1, get_int_setting(
         "camera_max_video_seconds", CAMERA_VIDEO_MAX_SECONDS))
+
+
+def effective_camera_preview_enabled():
+    """Живое MJPEG-превью камеры на странице Быстрого доступа."""
+    return get_int_setting("camera_preview_enabled", 1) == 1
 
 
 def get_db():
@@ -622,6 +648,11 @@ def start_background_maintenance():
                 ssh_bundles_cleanup()
             except Exception:
                 app.logger.exception("SSH bundles cleanup failed")
+            try:
+                with app.app_context():
+                    cleanup_tasks()
+            except Exception:
+                app.logger.exception("Tasks cleanup failed")
 
     t = threading.Thread(target=worker, daemon=True, name="goosko-maintenance")
     t.start()
@@ -1148,6 +1179,133 @@ POWER_ACTIONS = {
 POWER_CONFIRM_PHRASE = "Я УВЕРЕН"
 
 
+# --------- Асинхронные задачи быстрого доступа (polling-статусы) ---------
+# Статусы живут в БД, чтобы их видели все воркеры gunicorn.
+VIDEO_TASK_TTL = 30 * 60          # запись дольше 30 минут невозможна (лимит 600 с + буфер)
+TASK_DONE_TTL = 24 * 3600         # готовые статусы чистим через сутки
+
+def _task_row(task_id):
+    db = get_db()
+    return db.execute(
+        "SELECT status, filename, duration, error FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def cleanup_tasks():
+    """Удаляет зависшие/устаревшие записи задач."""
+    now = time.time()
+    db = get_db()
+    db.execute(
+        "DELETE FROM tasks WHERE status = 'running' AND started_at < ?",
+        (now - VIDEO_TASK_TTL,),
+    )
+    db.execute(
+        "DELETE FROM tasks WHERE status != 'running' AND started_at < ?",
+        (now - TASK_DONE_TTL,),
+    )
+    db.commit()
+
+
+def _run_video_task(task_id: str, duration: int):
+    """Выполняется в отдельном потоке: пишет видео и обновляет статус в БД.
+
+    Весь код работает внутри application context — иначе get_db()/audit()
+    падают с RuntimeError: Working outside of application context.
+    """
+    with app.app_context():
+        try:
+            ok, info = capture_video(QUICK_ACCESS_CONFIG, duration)
+            db = get_db()
+            if ok:
+                db.execute(
+                    "UPDATE tasks SET status='done', filename=? WHERE id=?",
+                    (os.path.basename(info), task_id),
+                )
+                db.commit()
+                audit("quick_video", f"{os.path.basename(info)} ({duration}s)")
+            else:
+                db.execute(
+                    "UPDATE tasks SET status='error', error=? WHERE id=?",
+                    (info[:500], task_id),
+                )
+                db.commit()
+        except Exception as exc:
+            app.logger.exception("video task %s failed", task_id)
+            try:
+                db = get_db()
+                db.execute("UPDATE tasks SET status='error', error=? WHERE id=?",
+                           (str(exc)[:500], task_id))
+                db.commit()
+            except Exception:
+                pass
+
+
+# --------- MJPEG-превью с камеры (для живого предпросмотра) ---------
+STREAM_MAX_AGE = 10 * 60           # поток живёт не дольше 10 минут
+_streams_lock = threading.Lock()
+_active_streams = {}               # username -> Popen
+
+
+def _terminate_stream(proc):
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    except OSError:
+        pass
+
+
+@app.route("/quick/stream.mjpg")
+@admin_required
+def quick_camera_stream():
+    """Живое MJPEG-превью камеры (ffmpeg -> multipart/x-mixed-replace)."""
+    user = session.get("user", "?")
+    with _streams_lock:
+        old = _active_streams.pop(user, None)
+    if old is not None:
+        _terminate_stream(old)
+
+    try:
+        proc = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-y",
+             "-f", "v4l2", "-input_format", "mjpeg",
+             "-video_size", QUICK_ACCESS_CONFIG.resolution,
+             "-i", QUICK_ACCESS_CONFIG.video_device,
+             "-c:v", "copy",
+             "-f", "mpjpeg", "-boundary_ptz", "preview",
+             "-"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        abort(502, description=f"Не удалось запустить поток камеры: {exc}")
+
+    _active_streams[user] = proc
+    deadline = time.monotonic() + STREAM_MAX_AGE
+
+    def generate():
+        try:
+            while time.monotonic() < deadline and proc.poll() is None:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            with _streams_lock:
+                if _active_streams.get(user) is proc:
+                    del _active_streams[user]
+            _terminate_stream(proc)
+
+    resp = Response(stream_with_context(generate()),
+                    mimetype="multipart/x-mixed-replace; boundary=preview")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
 # =====================================================================
 # 🔐 SSH-СЕРТИФИКАТЫ
 # =====================================================================
@@ -1255,6 +1413,10 @@ def security_headers(response):
         "base-uri 'none'; frame-ancestors 'none'; connect-src 'self'; "
         "form-action 'self'; frame-src 'none'"
     )
+
+    # MJPEG-превью камеры — картинка с того же origin (см. quick_camera_stream).
+    if request.path == "/quick/stream.mjpg":
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
 
     # Файлы из хранилища не должны кэшироваться общими кэшами в приватной зоне.
     if request.path.startswith("/private/"):
@@ -2298,6 +2460,8 @@ EDITABLE_SETTINGS = {
     "share_ttl_hours": ("Время жизни ссылки (часы)", 1, 24 * 90, False),
     "trash_retention_days": ("Хранение в корзине (дни)", 0, 365, False),
     "camera_max_video_seconds": ("Макс. длина видео с камеры (сек)", 1, 600, False),
+    "camera_preview_enabled": (
+        "Живое превью камеры на стр. Быстрого доступа (1=вкл, 0=выкл)", 0, 1, True),
     "stream_uploads": (
         "Потоковая отдача файлов с Range (1=вкл, 0=выкл)", 0, 1, True),
 }
@@ -2364,7 +2528,7 @@ AUDIT_ACTIONS = [
     "file_purged", "trash_purged", "share_created", "download",
     "user_added", "user_deleted", "settings_changed", "backup_downloaded",
     "ssh_cert_issued", "ssh_cert_revoked", "ssh_bundle_downloaded",
-    "quick_photo", "quick_video", "quick_screenshot",
+    "quick_photo", "quick_video", "quick_video_started", "quick_screenshot",
     "quick_media_deleted", "quick_media_purged", "power_action",
 ]
 
@@ -2602,6 +2766,8 @@ def quick_access_page():
                     "kind": kind,
                     "size": p.stat().st_size,
                     "mtime": datetime.fromtimestamp(p.stat().st_mtime).strftime("%d.%m.%Y %H:%M"),
+                    # jpg/png отдаём как <img>-превью прямо из quick_media_view
+                    "thumb": p.name.startswith(("cam_photo", "screenshot")),
                 })
             if len(media) >= 100:
                 break
@@ -2613,6 +2779,7 @@ def quick_access_page():
         config=QUICK_ACCESS_CONFIG,
         media=media,
         max_video_seconds=effective_camera_max_video_seconds(),
+        preview_enabled=effective_camera_preview_enabled(),
         photo_ttl_hours=CAMERA_PHOTO_TTL // 3600,
         confirm_phrase=POWER_CONFIRM_PHRASE,
     )
@@ -2657,13 +2824,48 @@ def quick_capture_video():
         return redirect(url_for("quick_access_page"))
 
     cleanup_media_files()
-    ok, info = capture_video(QUICK_ACCESS_CONFIG, duration)
-    if ok:
-        audit("quick_video", f"{os.path.basename(info)} ({duration}s)")
-        flash(f"✅ Видео записано ({duration} с): {os.path.basename(info)}")
-    else:
-        flash(f"❌ Не удалось записать видео: {info[:300]}")
+    with app.app_context():
+        cleanup_tasks()
+
+    # Запись идёт в отдельном потоке — страница не блокируется на минуты.
+    task_id = uuid.uuid4().hex
+    db = get_db()
+    db.execute(
+        "INSERT INTO tasks (id, status, duration, started_at) VALUES (?, 'running', ?, ?)",
+        (task_id, duration, time.time()),
+    )
+    db.commit()
+    threading.Thread(
+        target=_run_video_task, args=(task_id, duration),
+        daemon=True, name=f"goosko-video-{task_id[:8]}",
+    ).start()
+    audit("quick_video_started", f"{duration}s task={task_id[:8]}")
+
+    if request.accept_mimetypes.best_match(
+            ["application/json", "text/html"]) == "application/json":
+        return jsonify({"ok": True, "task_id": task_id, "duration": duration})
+    flash("⏳ Запись видео началась — статус обновится автоматически.")
     return redirect(url_for("quick_access_page"))
+
+
+@app.route("/quick/task/<task_id>")
+@admin_required
+def quick_video_status(task_id):
+    """JSON-статус фоновой видеозаписи для polling."""
+    if not re.fullmatch(r"[0-9a-f]{32}", task_id or ""):
+        abort(404)
+    row = _task_row(task_id)
+    if row is None:
+        abort(404)
+    payload = {"status": row["status"], "duration": row["duration"]}
+    if row["status"] == "done":
+        payload["filename"] = row["filename"]
+        payload["view_url"] = url_for("quick_media_view", media_id=row["filename"])
+    elif row["status"] == "error":
+        payload["error"] = (row["error"] or "Ошибка записи")[:300]
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.route("/quick/capture/screenshot", methods=["POST"])
