@@ -534,7 +534,7 @@ def login_required(f):
         if "user" not in session:
             # Запоминаем, куда хотел пойти пользователь (только внутренние пути)
             next_url = sanitize_next(request.full_path.rstrip("?"))
-            return redirect(url_for("index", next=next_url) if next_url else url_for("index"))
+            return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
         return f(*args, **kwargs)
     return wrapped
 
@@ -543,7 +543,8 @@ def admin_required(f):
     @functools.wraps(f)
     def wrapped(*args, **kwargs):
         if "user" not in session:
-            return redirect(url_for("index"))
+            next_url = sanitize_next(request.full_path.rstrip("?"))
+            return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
         if not session.get("is_admin"):
             abort(403)
         return f(*args, **kwargs)
@@ -1442,9 +1443,15 @@ def login_record_failure(username):
                     _login_failures.pop(k, None)
 
 
-@app.route("/login", methods=["POST"])
+@app.route("/login", methods=["GET", "POST"])
 @limiter.limit("10 per minute")
 def login():
+    # GET: самостоятельная страница входа (удобно ссылаться извне и из шаблонов)
+    if request.method == "GET":
+        if "user" in session:
+            return redirect(url_for("index"))
+        next_url = sanitize_next(request.args.get("next"))
+        return render_template("login.html", next_url=next_url or "")
     username = request.form.get("u", "").strip()
     password = request.form.get("p", "")
 
