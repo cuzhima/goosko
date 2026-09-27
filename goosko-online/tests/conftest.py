@@ -26,13 +26,31 @@ def env(tmp_path, monkeypatch):
 
     # Чистим кэш модулей, чтобы app.py заново применил переменные окружения
     for name in list(sys.modules):
-        if name == "app" or name.startswith("app."):
+        if name in ("app", "quick_access") or name.startswith("app."):
             del sys.modules[name]
 
     sys.path.insert(0, APP_DIR)
     import app as app_module
-    yield app_module
+    import quick_access as qa_module
+
+    class _Env:
+        """Фасад для тестов: атрибуты app.py + перенесённые в
+        quick_access.py символы модуля «Быстрый доступ»."""
+
+        def __getattr__(self, name):
+            if hasattr(app_module, name):
+                return getattr(app_module, name)
+            return getattr(qa_module, name)
+
+    yield _Env()
     sys.path.remove(APP_DIR)
+
+
+@pytest.fixture()
+def qa():
+    """Модуль quick_access, импортированный в текущем тестовом окружении."""
+    import quick_access
+    return quick_access
 
 
 @pytest.fixture()

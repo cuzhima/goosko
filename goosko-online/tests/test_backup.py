@@ -82,7 +82,7 @@ class TestBackupAudit:
         assert "backup_downloaded" in _audit_actions(admin_client, env)
 
     def test_too_large_db_returns_413(self, admin_client, env, monkeypatch):
-        monkeypatch.setattr(env, "BACKUP_MAX_DB_BYTES", 10)  # 10 байт
+        monkeypatch.setattr(__import__("app"), "BACKUP_MAX_DB_BYTES", 10)  # 10 байт
         assert admin_client.get("/admin/backup").status_code == 413
         # и при этом не записан успех
         assert "backup_downloaded" not in _audit_actions(admin_client, env)

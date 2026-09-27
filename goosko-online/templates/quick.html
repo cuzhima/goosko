@@ -15,7 +15,7 @@
     <h2>🔴 Живое превью камеры</h2>
     <img id="cam-preview" alt="Превью с камеры"
          style="max-width:100%;border-radius:8px;background:#111;"
-         src="{{ url_for('quick_camera_stream') }}">
+         src="{{ url_for('quick_access.quick_camera_stream') }}">
     <p class="muted">Поток автоматически останавливается через 10 минут.
         Отключается в админских настройках (<code>camera_preview_enabled</code>).</p>
 </div>
@@ -25,7 +25,7 @@
     <div class="card">
         <h2>📷 Фото с камеры</h2>
         <p>Один кадр с веб-камеры сервера.</p>
-        <form method="post" action="{{ url_for('quick_capture_photo') }}">
+        <form method="post" action="{{ url_for('quick_access.quick_capture_photo') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn primary" type="submit">📸 Сделать фото</button>
         </form>
@@ -33,7 +33,7 @@
 
     <div class="card">
         <h2>🎥 Видео с камеры</h2>
-        <form method="post" action="{{ url_for('quick_capture_video') }}" id="video-form">
+        <form method="post" action="{{ url_for('quick_access.quick_capture_video') }}" id="video-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <label class="field">
                 Длительность (секунды, 1–{{ max_video_seconds }})
@@ -47,7 +47,7 @@
     <div class="card">
         <h2>🖥️ Скриншот экрана</h2>
         <p>Снимок рабочего стола сервера (<code>{{ config.screen_device }}</code>).</p>
-        <form method="post" action="{{ url_for('quick_capture_screenshot') }}">
+        <form method="post" action="{{ url_for('quick_access.quick_capture_screenshot') }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="btn primary" type="submit">🖼️ Сделать скриншот</button>
         </form>
@@ -58,14 +58,14 @@
         <p class="muted">Опасные действия. Для выполнения введите фразу
             <code>{{ confirm_phrase }}</code> — это защита от случайного нажатия.</p>
 
-        <form method="post" action="{{ url_for('quick_power', action='reboot') }}"
+        <form method="post" action="{{ url_for('quick_access.quick_power', action='reboot') }}"
               data-confirm-power="{{ confirm_phrase }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="field" type="text" name="confirm" placeholder="Введите: {{ confirm_phrase }}" autocomplete="off" required>
             <button class="btn warn" type="submit">♻️ Перезагрузить</button>
         </form>
 
-        <form method="post" action="{{ url_for('quick_power', action='shutdown') }}"
+        <form method="post" action="{{ url_for('quick_access.quick_power', action='shutdown') }}"
               data-confirm-power="{{ confirm_phrase }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input class="field" type="text" name="confirm" placeholder="Введите: {{ confirm_phrase }}" autocomplete="off" required>
@@ -95,9 +95,9 @@
                     <td>{{ m.kind }}</td>
                     <td class="media-cell">
                         {% if m.thumb %}
-                        <a href="{{ url_for('quick_media_view', media_id=m.id) }}"
+                        <a href="{{ url_for('quick_access.quick_media_view', media_id=m.id) }}"
                            target="_blank" rel="noopener">
-                            <img src="{{ url_for('quick_media_view', media_id=m.id) }}"
+                            <img src="{{ url_for('quick_access.quick_media_view', media_id=m.id) }}"
                                  alt="{{ m.id }}" loading="lazy"
                                  style="max-height:72px;max-width:160px;border-radius:6px;display:block;">
                         </a>
@@ -107,8 +107,8 @@
                     <td>{{ m.size | human_size }}</td>
                     <td>{{ m.mtime }}</td>
                     <td class="file-actions">
-                        <a class="btn small" href="{{ url_for('quick_media_view', media_id=m.id) }}" target="_blank" rel="noopener">Открыть</a>
-                        <form method="post" action="{{ url_for('quick_delete_media') }}" class="inline-form">
+                        <a class="btn small" href="{{ url_for('quick_access.quick_media_view', media_id=m.id) }}" target="_blank" rel="noopener">Открыть</a>
+                        <form method="post" action="{{ url_for('quick_access.quick_delete_media') }}" class="inline-form">
                             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <input type="hidden" name="id" value="{{ m.id }}">
                             <button class="btn small danger" type="submit">Удалить</button>
@@ -120,7 +120,7 @@
         </table>
     </div>
 
-    <form method="post" action="{{ url_for('quick_purge_media') }}" class="inline-form">
+    <form method="post" action="{{ url_for('quick_access.quick_purge_media') }}" class="inline-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="btn danger" type="submit">🧹 Очистить всё</button>
     </form>

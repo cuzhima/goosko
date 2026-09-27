@@ -31,13 +31,13 @@ class TestVideoTask:
         assert status["status"] in ("running", "done")
         assert status["duration"] == 2
 
-    def test_video_task_completes_with_file(self, admin_client, env, monkeypatch):
+    def test_video_task_completes_with_file(self, admin_client, env, monkeypatch, qa):
         def fake_capture(config, duration):
-            path = env.MEDIA_DIR / f"cam_video_20260101_120000_abcd1234.mp4"
+            path = qa.MEDIA_DIR / f"cam_video_20260101_120000_abcd1234.mp4"
             path.write_bytes(b"fake mp4")
             return True, str(path)
 
-        monkeypatch.setattr(env, "capture_video", fake_capture)
+        monkeypatch.setattr(qa, "capture_video", fake_capture)
         token = get_csrf(admin_client, "/quick")
         r = admin_client.post(
             "/quick/capture/video",
@@ -52,9 +52,9 @@ class TestVideoTask:
         # Готовый файл отдаётся
         assert admin_client.get(data["view_url"]).status_code == 200
 
-    def test_video_task_error_reported(self, admin_client, monkeypatch, env):
+    def test_video_task_error_reported(self, admin_client, monkeypatch, env, qa):
         monkeypatch.setattr(
-            env, "capture_video", lambda c, d: (False, "ffmpeg: device busy"))
+            qa, "capture_video", lambda c, d: (False, "ffmpeg: device busy"))
         token = get_csrf(admin_client, "/quick")
         r = admin_client.post(
             "/quick/capture/video",
@@ -65,9 +65,9 @@ class TestVideoTask:
         assert data["status"] == "error"
         assert "device busy" in data["error"]
 
-    def test_form_flow_still_redirects(self, admin_client, monkeypatch, env):
+    def test_form_flow_still_redirects(self, admin_client, monkeypatch, env, qa):
         monkeypatch.setattr(
-            env, "capture_video", lambda c, d: (False, "no camera"))
+            qa, "capture_video", lambda c, d: (False, "no camera"))
         token = get_csrf(admin_client, "/quick")
         r = admin_client.post("/quick/capture/video",
                               data={"csrf_token": token, "duration": "2"})
@@ -93,11 +93,11 @@ class TestVideoTask:
     def test_unknown_task_404(self, admin_client):
         assert admin_client.get("/quick/task/" + "a" * 32).status_code == 404
 
-    def test_cleanup_tasks_removes_stale(self, app, env):
+    def test_cleanup_tasks_removes_stale(self, app, env, qa):
         with app.app_context():
             db = env.get_db()
-            old_running = time.time() - env.VIDEO_TASK_TTL - 10
-            old_done = time.time() - env.TASK_DONE_TTL - 10
+            old_running = time.time() - qa.VIDEO_TASK_TTL - 10
+            old_done = time.time() - qa.TASK_DONE_TTL - 10
             fresh = time.time()
             for tid, st, ts in [("1" * 32, "running", old_running),
                                 ("2" * 32, "done", old_done),
@@ -106,7 +106,7 @@ class TestVideoTask:
                     "INSERT INTO tasks (id,status,duration,started_at)"
                     " VALUES (?,?,?,?)", (tid, st, 5, ts))
             db.commit()
-            env.cleanup_tasks()
+            qa.cleanup_tasks()
             rows = {r["id"]: r["status"] for r in
                     db.execute("SELECT id,status FROM tasks")}
             assert rows == {"3" * 32: "running"}
@@ -119,7 +119,7 @@ class TestCameraStream:
     def test_stream_alice_forbidden(self, alice):
         assert alice.get("/quick/stream.mjpg").status_code == 403
 
-    def test_stream_launches_ffmpeg_and_headers(self, admin_client, monkeypatch, env):
+    def test_stream_launches_ffmpeg_and_headers(self, admin_client, monkeypatch, env, qa):
         started = {}
 
         class FakeProc:
@@ -141,7 +141,7 @@ class TestCameraStream:
             started["cmd"] = cmd
             return FakeProc()
 
-        monkeypatch.setattr(env.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(qa.subprocess, "Popen", fake_popen)
         r = admin_client.get("/quick/stream.mjpg")
         assert r.status_code == 200
         assert r.headers["Content-Type"].startswith("multipart/x-mixed-replace")
@@ -155,11 +155,11 @@ class TestCameraStream:
         r.get_data()
         assert started.get("terminated") is True
 
-    def test_stream_oserror_502(self, admin_client, monkeypatch, env):
+    def test_stream_oserror_502(self, admin_client, monkeypatch, env, qa):
         def boom(*a, **k):
             raise OSError("no such device")
 
-        monkeypatch.setattr(env.subprocess, "Popen", boom)
+        monkeypatch.setattr(qa.subprocess, "Popen", boom)
         assert admin_client.get("/quick/stream.mjpg").status_code == 502
 
     def test_preview_toggle_setting(self, admin_client, app, env):
@@ -184,10 +184,10 @@ class TestCameraStream:
 
 
 class TestGalleryThumbs:
-    def test_gallery_shows_thumbs_for_images_only(self, admin_client, env):
-        env.ensure_dir(str(env.MEDIA_DIR))
-        (env.MEDIA_DIR / "cam_photo_20260101_120000_aaaaaaaa.jpg").write_bytes(b"x")
-        (env.MEDIA_DIR / "cam_video_20260101_120000_bbbbbbbb.mp4").write_bytes(b"y")
+    def test_gallery_shows_thumbs_for_images_only(self, admin_client, env, qa):
+        qa.ensure_dir(str(qa.MEDIA_DIR))
+        (qa.MEDIA_DIR / "cam_photo_20260101_120000_aaaaaaaa.jpg").write_bytes(b"x")
+        (qa.MEDIA_DIR / "cam_video_20260101_120000_bbbbbbbb.mp4").write_bytes(b"y")
         html = admin_client.get("/quick").get_data(as_text=True)
         assert 'src="/quick/media/cam_photo_20260101_120000_aaaaaaaa.jpg"' in html
         # для видео превью-картинки нет — только ссылка «Открыть»

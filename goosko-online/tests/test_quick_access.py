@@ -16,16 +16,16 @@ class TestAccessControl:
 
 
 class TestMediaIdWhitelist:
-    def test_resolve_valid_names(self, env):
+    def test_resolve_valid_names(self, env, qa):
         ok = [
             "cam_photo_20260101_120000_abcd1234.jpg",
             "cam_video_20260101_120000_abcd1234.mp4",
             "screenshot_20260101_120000_abcd1234.png",
         ]
         for name in ok:
-            assert env.MEDIA_ID_RE.fullmatch(name), name
+            assert qa.MEDIA_ID_RE.fullmatch(name), name
 
-    def test_reject_traversal_and_bad_ext(self, env):
+    def test_reject_traversal_and_bad_ext(self, env, qa):
         bad = [
             "../../etc/passwd",
             "cam_photo_20260101_120000_abcd1234.exe",
@@ -35,7 +35,7 @@ class TestMediaIdWhitelist:
             "CAM_PHOTO_20260101_120000_abcd1234.JPG",
         ]
         for name in bad:
-            assert env.resolve_media_file(name) is None
+            assert qa.resolve_media_file(name) is None
 
     def test_view_unknown_media_404(self, admin_client):
         assert admin_client.get("/quick/media/nope.jpg").status_code == 404
@@ -86,13 +86,12 @@ class TestPower:
                               data={"csrf_token": token, "confirm": "Я УВЕРЕН"})
         assert r.status_code == 404
 
-    def test_power_wrong_confirm_not_executed(self, admin_client, monkeypatch):
+    def test_power_wrong_confirm_not_executed(self, admin_client, monkeypatch, qa):
         calls = []
         monkeypatch.setattr(
             type(admin_client), "post", admin_client.post)  # no-op
-        # перехватываем run_cmd на уровне модуля app
-        import sys
-        app_mod = sys.modules["app"]
+        # перехватываем run_cmd на уровне модуля quick_access
+        app_mod = qa
         orig = app_mod.run_cmd
         app_mod.run_cmd = lambda cmd, **kw: (calls.append(cmd), (False, "", "blocked"))[1]
         try:
@@ -103,9 +102,8 @@ class TestPower:
         finally:
             app_mod.run_cmd = orig
 
-    def test_power_correct_confirm_executes_script(self, admin_client, monkeypatch):
-        import sys
-        app_mod = sys.modules["app"]
+    def test_power_correct_confirm_executes_script(self, admin_client, monkeypatch, qa):
+        app_mod = qa
         calls = []
         orig = app_mod.run_cmd
 
@@ -133,20 +131,20 @@ class TestMediaDeletePurge:
         html = admin_client.get("/quick").get_data(as_text=True)
         assert "Файл не найден" in html
 
-    def test_delete_real_file(self, admin_client, env):
+    def test_delete_real_file(self, admin_client, env, qa):
         name = "cam_photo_20260101_120000_deadbeef.jpg"
-        path = env.MEDIA_DIR / name
+        path = qa.MEDIA_DIR / name
         path.write_bytes(b"fake jpg")
         token = get_csrf(admin_client, "/quick")
         admin_client.post("/quick/delete",
                           data={"csrf_token": token, "id": name})
         assert not path.exists()
 
-    def test_purge_removes_all(self, admin_client, env):
-        (env.MEDIA_DIR / "cam_photo_20260101_120000_aaaaaaaa.jpg").write_bytes(b"x")
-        (env.MEDIA_DIR / "cam_video_20260101_120000_bbbbbbbb.mp4").write_bytes(b"x")
+    def test_purge_removes_all(self, admin_client, env, qa):
+        (qa.MEDIA_DIR / "cam_photo_20260101_120000_aaaaaaaa.jpg").write_bytes(b"x")
+        (qa.MEDIA_DIR / "cam_video_20260101_120000_bbbbbbbb.mp4").write_bytes(b"x")
         token = get_csrf(admin_client, "/quick")
         admin_client.post("/quick/purge", data={"csrf_token": token})
-        remaining = [p.name for p in env.MEDIA_DIR.iterdir()
-                     if env.MEDIA_ID_RE.fullmatch(p.name)]
+        remaining = [p.name for p in qa.MEDIA_DIR.iterdir()
+                     if qa.MEDIA_ID_RE.fullmatch(p.name)]
         assert remaining == []
