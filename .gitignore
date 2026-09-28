@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 
-# Logs and temp files
+# Logs
 *.log
 
 # Database files
