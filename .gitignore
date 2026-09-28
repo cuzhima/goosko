@@ -1,9 +1,9 @@
-# Python compiled files
+# Compiled/Binary files
 __pycache__/
 *.pyc
 
 # Logs
 *.log
 
-# Database files (generated)
+# Database files
 *.db
