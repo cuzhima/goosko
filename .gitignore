@@ -1,11 +1,9 @@
-# Compiled and build artifacts
+# Compiled/Binary files
 __pycache__/
 *.pyc
 
 # Logs and temp files
 *.log
-*.tmp
 
-# Environment
-.env
-.env.local
+# Database files
+*.db
