@@ -1121,11 +1121,13 @@ def csrf_error(e):
         )
     except Exception:
         pass
-    return render_template(
-        "error.html", code="400", icon="🧩",
-        title="Ошибка CSRF",
-        description="Обновите страницу и попробуйте снова.",
-    ), 400
+    # Мягкий возврат: форма от другого хоста/устаревшая сессия — не тупик,
+    # а новый логин на текущем хосте (отправим свежую session-куку).
+    if request.method != "GET" and request.path not in ("/login",):
+        flash("Сессия больше недействительна. Попробуйте ещё раз.")
+        return redirect("/")
+    flash("Время формы истекло. Попробуйте снова.")
+    return redirect("/")
 
 
 @app.errorhandler(Exception)
