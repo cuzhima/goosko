@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Временный канал для БОЛЬШИХ ЗАГРУЗОК: funnel только для /upload-big/, авто-выключение.
+# Tailscale Funnel (ts.net): ПОСТОЯННЫЙ канал — весь сайт.
+# Включение: tailscale funnel для / (Angie 127.0.0.1:80) без авто-выключения.
+# Выключение: tailscale funnel reset (канал полностью снимается).
 # Использование: goosko-funnel start|stop|status
 set -euo pipefail
 
 STATE_FILE=/run/goosko/funnel
-AUTOOFF_MIN=${GOOSKO_FUNNEL_TTL:-45}
 
 funnel_url() {
     # FQDN узла из tailscale status (Self.DNSName)
@@ -25,13 +26,6 @@ write_state() {
     chmod 644 "$STATE_FILE"
 }
 
-prepare_autooff_timer() {
-    systemctl stop goosko-funnel-autooff.timer goosko-funnel-autooff.service 2>/dev/null || true
-    systemctl reset-failed goosko-funnel-autooff.timer goosko-funnel-autooff.service 2>/dev/null || true
-    systemd-run --on-active="${AUTOOFF_MIN}min" --unit=goosko-funnel-autooff \
-        /usr/local/sbin/goosko-funnel stop >/dev/null
-}
-
 case "${1:-}" in
     start)
         URL=$(funnel_url)
@@ -40,14 +34,16 @@ case "${1:-}" in
             exit 1
         fi
 
-        if ! tailscale funnel --bg --https 443 --set-path /upload-big/ http://127.0.0.1:5000/upload-big/; then
+        if ! tailscale funnel --bg --https 443 http://127.0.0.1:80; then
             echo "tailscale funnel не включился"
             exit 1
         fi
+        # На случай, если остался старый 45-минутный таймер — убираем.
+        systemctl stop goosko-funnel-autooff.timer goosko-funnel-autooff.service 2>/dev/null || true
+        systemctl reset-failed goosko-funnel-autooff.timer goosko-funnel-autooff.service 2>/dev/null || true
 
-        prepare_autooff_timer
         write_state "on ${URL}"
-        echo "Канал включён: ${URL}/upload-big/ (авто-выключение через ${AUTOOFF_MIN} мин)"
+        echo "Канал включён (постоянно): ${URL}/"
         ;;
     stop)
         tailscale funnel reset >/dev/null 2>&1 || true

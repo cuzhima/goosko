@@ -95,7 +95,7 @@
         const funnel = data.funnel || {};
         setText("funnel-state", funnel.on ? "включён" : "выключен");
         const funnelUrl = byId("funnel-url");
-        if (funnelUrl) funnelUrl.textContent = funnel.on && funnel.url ? funnel.url + "/upload-big/" : "";
+        if (funnelUrl) funnelUrl.textContent = funnel.on && funnel.url ? funnel.url + "/" : "";
 
         const config = data.config || {};
         if (config.high_temp || config.critical_temp) {

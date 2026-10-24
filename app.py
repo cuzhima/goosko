@@ -1508,11 +1508,11 @@ def cloud_biglink():
     if funnel_on and funnel_base:
         fast_url = funnel_base.rstrip("/") + f"/upload-big/{token}"
         flash(f"🎫 Через Cloudflare (до ~100 МБ): {url}")
-        flash(f"🚀 Временный канал без лимита CF: {fast_url}")
+        flash(f"🚀 Прямой канал без лимита CF (ts.net): {fast_url}")
     else:
         flash(
             f"🎫 Ссылка для больших файлов (действует 1 час): {url}. "
-            "Для файлов >100 МБ временно включи канал в разделе /system"
+            "Для файлов >100 МБ включи Tailscale Funnel в разделе /system"
         )
     return redirect(url_for("cloud"))
 
