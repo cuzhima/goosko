@@ -87,9 +87,6 @@ USER_QUOTA = int(os.environ.get("USER_QUOTA", 20 * 1024 * 1024 * 1024))
 TOKEN_TTL = int(os.environ.get("UPLOAD_TOKEN_TTL", 3600))
 SHARE_TTL_HOURS = int(os.environ.get("SHARE_TTL_HOURS", 24))
 
-FUNNEL_HOST = os.environ.get(
-    "FUNNEL_HOST", "https://andrey-monoblock.tail098776.ts.net"
-)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://goosko.online").rstrip("/")
 
 USE_X_ACCEL = os.environ.get("USE_X_ACCEL", "1") == "1"
@@ -178,7 +175,19 @@ class DynamicCookieSessionInterface(SecureCookieSessionInterface):
 app.session_interface = DynamicCookieSessionInterface()
 
 csrf = CSRFProtect(app)
-limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
+def _limiter_storage():
+    """Redis как единый storage лимитов; при недоступности — fallback на память."""
+    try:
+        import redis as redis_lib
+        redis_lib.Redis(
+            host="127.0.0.1", port=6379, db=0, socket_connect_timeout=1
+        ).ping()
+        return "redis://127.0.0.1:6379/0"
+    except Exception:
+        return "memory://"
+
+
+limiter = Limiter(get_remote_address, app=app, storage_uri=_limiter_storage())
 
 
 # =====================================================================
@@ -433,7 +442,6 @@ def parse_db_dt(value):
 def inject_globals():
     return {
         "public_base_url": PUBLIC_BASE_URL,
-        "funnel_host": FUNNEL_HOST,
         "user_quota": USER_QUOTA,
     }
 
@@ -1471,20 +1479,20 @@ def cloud_upload():
 
 
 # =====================================================================
-# ОБЛАКО: ССЫЛКА ДЛЯ БОЛЬШОЙ ЗАГРУЗКИ
+# ОБЛАЧНО: ССЫЛКА ДЛЯ БОЛЬШОЙ ЗАГРУЗКИ
 # =====================================================================
 @app.route("/cloud/biglink")
 @login_required
 def cloud_biglink():
     token = make_upload_token(session["user"])
-    url = f"{FUNNEL_HOST}/upload-big/{token}"
+    url = f"{PUBLIC_BASE_URL}/upload-big/{token}"
     audit("biglink_created", session["user"])
     flash(f"🎫 Ссылка для больших файлов (действует 1 час): {url}")
     return redirect(url_for("cloud"))
 
 
 # =====================================================================
-# БОЛЬШАЯ ЗАГРУЗКА ЧЕРЕЗ FUNNEL
+# БОЛЬШАЯ ЗАГРУЗКА ПО ТОКЕНУ
 # =====================================================================
 @app.route("/upload-big/<token>", methods=["GET", "POST"])
 @csrf.exempt
@@ -2375,9 +2383,20 @@ def web_manifest():
 
 @app.route("/sw.js")
 def service_worker():
-    response = send_from_directory(
-        app.static_folder, "sw.js", mimetype="application/javascript",
+    """sw.js с версией кеша по SHA коммита: обновление PWA после деплоя."""
+    sw_path = os.path.join(app.static_folder, "sw.js")
+    try:
+        with open(sw_path, "r", encoding="utf-8") as f:
+            sw_content = f.read()
+    except OSError:
+        return "console.error('sw.js not found');", 404
+    sw_content = re.sub(
+        r'(CACHE_NAME\s*=\s*)"[^"]*"',
+        r'\1"goosko-' + GIT_SHA + '"',
+        sw_content,
+        count=1,
     )
+    response = app.response_class(sw_content, mimetype="application/javascript")
     response.headers["Service-Worker-Allowed"] = "/"
     response.headers["Cache-Control"] = "no-cache"
     return response
