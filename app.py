@@ -23,6 +23,7 @@ import hmac
 import time
 import shutil
 import subprocess
+import subprocess
 import tempfile
 import mimetypes
 from datetime import datetime, timedelta, timezone
@@ -100,6 +101,22 @@ DISPLAY_HELPER = os.environ.get("DISPLAY_HELPER", "/usr/local/sbin/goosko-displa
 POWER_HELPER = os.environ.get("POWER_HELPER", "/usr/local/sbin/goosko-power")
 DISK_HELPER = os.environ.get("DISK_HELPER", "/usr/local/sbin/goosko-disk-tune")
 HELPER_TIMEOUT = int(os.environ.get("HELPER_TIMEOUT", "30"))
+
+
+def _git_commit():
+    """SHA текущего коммита (для /healthz и кеш-разделения sw.js)."""
+    try:
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3, check=True,
+        ).stdout.strip()
+        return out or "unknown"
+    except Exception:
+        return "unknown"
+
+
+GIT_SHA = _git_commit()
 
 
 # =====================================================================
@@ -2330,6 +2347,12 @@ def system_action():
 # =====================================================================
 # СЛУЖЕБНЫЙ РОУТ (для auth_request в Nginx)
 # =====================================================================
+@app.route("/healthz")
+def healthz():
+    """Публичный healthcheck: nginx/мониторинг проверяют живость."""
+    return _json_response({"ok": True, "sha": GIT_SHA}, 200)
+
+
 @app.route("/check")
 def check():
     if "user" in session:

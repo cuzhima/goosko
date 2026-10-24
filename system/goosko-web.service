@@ -1,0 +1,20 @@
+[Unit]
+Description=Goosko Flask (Flask + Gunicorn)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=andrey
+Group=andrey
+WorkingDirectory=/home/andrey/goosko-site
+
+# Секреты держим в отдельном файле с правами 600, а не plaintext в юните
+EnvironmentFile=/home/andrey/.goosko_secret
+
+ExecStart=/home/andrey/goosko-site/venv/bin/gunicorn --timeout 3600 --workers 2 --bind 127.0.0.1:5000 app:app
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
