@@ -53,8 +53,17 @@ case "${1:-}" in
         echo "Канал выключен"
         ;;
     status)
+        # State-файл живёт в tmpfs; после ребута перепроверяем факт через tailscale.
         if [ -r "$STATE_FILE" ]; then
             cat "$STATE_FILE"
+        elif tailscale serve status 2>/dev/null | grep -q "Funnel on"; then
+            URL=$(funnel_url)
+            if [ -n "$URL" ]; then
+                write_state "on ${URL}"
+                cat "$STATE_FILE"
+            else
+                echo on
+            fi
         else
             echo off
         fi

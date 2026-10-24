@@ -24,7 +24,6 @@ import hmac
 import time
 import shutil
 import subprocess
-import subprocess
 import tempfile
 import mimetypes
 from datetime import datetime, timedelta, timezone
@@ -2155,14 +2154,30 @@ SYSTEM_ACTIONS = {
 
 
 def funnel_state():
-    """(on, url) из state-файла, который пишет goosko-funnel."""
+    """(on, url): из state-файла, а после ребута /run — по факту через tailscale.
+
+    State-файл живёт в tmpfs (/run/goosko) и протухает при перезагрузке, хотя
+    конфиг funnel у tailscale персистентный — поэтому если файл не «on»,
+    перепроверяем реальное состояние канала.
+    """
     value = _read_text(FUNNEL_STATE_FILE)
-    if not value:
-        return False, None
-    parts = value.split()
-    if parts[0] != "on" or len(parts) < 2:
-        return False, None
-    return True, parts[1]
+    if value:
+        parts = value.split()
+        if parts[0] == "on" and len(parts) >= 2:
+            return True, parts[1]
+    try:
+        out = subprocess.run(
+            ["tailscale", "serve", "status"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout
+        if "Funnel on" not in out:
+            return False, None
+        match = re.search(r"https://([a-z0-9\-\.]+\.ts\.net)", out)
+        if match:
+            return True, f"https://{match.group(1)}"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return False, None
 
 
 def _read_text(path, default=None):
