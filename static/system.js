@@ -92,6 +92,11 @@
         const range = byId("brightness-range");
         if (range && backlight) range.value = backlight.percent;
 
+        const funnel = data.funnel || {};
+        setText("funnel-state", funnel.on ? "включён" : "выключен");
+        const funnelUrl = byId("funnel-url");
+        if (funnelUrl) funnelUrl.textContent = funnel.on && funnel.url ? funnel.url + "/upload-big/" : "";
+
         const config = data.config || {};
         if (config.high_temp || config.critical_temp) {
             setText(
@@ -109,7 +114,7 @@
         const helpers = data.helpers || {};
         const missing = byId("sys-helpers");
         if (missing) {
-            missing.hidden = helpers.display && helpers.power && helpers.disk;
+            missing.hidden = helpers.display && helpers.power && helpers.disk && helpers.funnel;
         }
 
         setText(

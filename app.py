@@ -97,6 +97,8 @@ SYSTEM_STATUS_FILE = os.environ.get("SYSTEM_STATUS_FILE", "/run/goosko/system.js
 DISPLAY_HELPER = os.environ.get("DISPLAY_HELPER", "/usr/local/sbin/goosko-display")
 POWER_HELPER = os.environ.get("POWER_HELPER", "/usr/local/sbin/goosko-power")
 DISK_HELPER = os.environ.get("DISK_HELPER", "/usr/local/sbin/goosko-disk-tune")
+FUNNEL_HELPER = os.environ.get("FUNNEL_HELPER", "/usr/local/sbin/goosko-funnel")
+FUNNEL_STATE_FILE = os.environ.get("FUNNEL_STATE_FILE", "/run/goosko/funnel")
 HELPER_TIMEOUT = int(os.environ.get("HELPER_TIMEOUT", "30"))
 
 
@@ -1488,7 +1490,17 @@ def cloud_biglink():
     token = make_upload_token(session["user"])
     url = f"{PUBLIC_BASE_URL}/upload-big/{token}"
     audit("biglink_created", session["user"])
-    flash(f"🎫 Ссылка для больших файлов (действует 1 час): {url}")
+
+    funnel_on, funnel_base = funnel_state()
+    if funnel_on and funnel_base:
+        fast_url = funnel_base.rstrip("/") + f"/upload-big/{token}"
+        flash(f"🎫 Через Cloudflare (до ~100 МБ): {url}")
+        flash(f"🚀 Временный канал без лимита CF: {fast_url}")
+    else:
+        flash(
+            f"🎫 Ссылка для больших файлов (действует 1 час): {url}. "
+            "Для файлов >100 МБ временно включи канал в разделе /system"
+        )
     return redirect(url_for("cloud"))
 
 
@@ -2109,7 +2121,20 @@ SYSTEM_ACTIONS = {
     "power_balanced": (POWER_HELPER, ["balanced"]),
     "power_performance": (POWER_HELPER, ["performance"]),
     "disk_tune": (DISK_HELPER, []),
+    "funnel_on": (FUNNEL_HELPER, ["start"]),
+    "funnel_off": (FUNNEL_HELPER, ["stop"]),
 }
+
+
+def funnel_state():
+    """(on, url) из state-файла, который пишет goosko-funnel."""
+    value = _read_text(FUNNEL_STATE_FILE)
+    if not value:
+        return False, None
+    parts = value.split()
+    if parts[0] != "on" or len(parts) < 2:
+        return False, None
+    return True, parts[1]
 
 
 def _read_text(path, default=None):
@@ -2226,6 +2251,7 @@ def get_system_status():
     cpu = dict(saved.get("cpu") or {})
     disk = dict(saved.get("disk") or {})
     display = dict(saved.get("display") or {})
+    funnel_on, funnel_url = funnel_state()
 
     cpu["model"] = cpu.get("model") or _cpu_model()
     cpu["temp"] = _cpu_temp()
@@ -2285,10 +2311,12 @@ def get_system_status():
         "updated": updated,
         "stale": stale,
         "server_time": int(time.time()),
+        "funnel": {"on": funnel_on, "url": funnel_url},
         "helpers": {
             "display": os.path.exists(DISPLAY_HELPER),
             "power": os.path.exists(POWER_HELPER),
             "disk": os.path.exists(DISK_HELPER),
+            "funnel": os.path.exists(FUNNEL_HELPER),
         },
     }
 

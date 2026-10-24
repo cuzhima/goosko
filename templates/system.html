@@ -111,12 +111,29 @@
     </div>
 </div>
 
-<div class="card">
-    <h2>ℹ️ Обновление</h2>
-    <p class="muted">
-        Данные монитора: <span id="sys-updated">—</span> ·
-        сервер: <span id="sys-clock">—</span>
-    </p>
+<div class="grid two">
+    <div class="card">
+        <h2>🚀 Канал больших загрузок</h2>
+        <p>Состояние: <strong id="funnel-state">—</strong></p>
+        <p class="muted" id="funnel-url"></p>
+
+        <div class="file-actions">
+            <button class="btn primary" type="button" data-system-action="funnel_on">Включить на 45 мин</button>
+            <button class="btn danger" type="button" data-system-action="funnel_off">Выключить</button>
+        </div>
+        <p class="muted">
+            Открывает доступ в интернет ТОЛЬКО к странице загрузки /upload-big/ (обходит лимит
+            Cloudflare ~100 МБ). Остальной сайт остаётся за Cloudflare. Авто-выключение через 45 минут.
+        </p>
+    </div>
+
+    <div class="card">
+        <h2>ℹ️ Обновление</h2>
+        <p class="muted">
+            Данные монитора: <span id="sys-updated">—</span> ·
+            сервер: <span id="sys-clock">—</span>
+        </p>
+    </div>
 </div>
 {% endblock %}
 
