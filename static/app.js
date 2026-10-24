@@ -1,5 +1,28 @@
 const THEME_KEY = "goosko-theme";
 
+function fmtBytes(bytes) {
+    const units = ["Б", "КБ", "МБ", "ГБ", "ТБ"];
+    let value = Number(bytes) || 0;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+    }
+    return value.toFixed(unit ? 1 : 0) + " " + units[unit];
+}
+
+function fileLimitFor(form, input) {
+    const limitAttr = input?.dataset.maxSize || form.dataset.maxSize;
+    const limit = limitAttr ? parseInt(limitAttr, 10) : 0;
+    if (!limit || isNaN(limit) || limit <= 0) return 0;
+
+    if (form.dataset.quotaRemaining) {
+        const quota = parseInt(form.dataset.quotaRemaining, 10);
+        if (!isNaN(quota) && quota >= 0 && quota < limit) return quota;
+    }
+    return limit;
+}
+
 function showToast(message, type = "info", timeout = 4000) {
     const stack = document.getElementById("toast-stack");
     if (!stack) {
@@ -173,9 +196,31 @@ function initFileDrop() {
 
         input.addEventListener("change", () => {
             const label = dropzone.querySelector("[data-file-name]");
-            if (label && input.files.length) {
-                label.textContent = input.files[0].name;
+            if (!label) return;
+
+            if (!input.files.length) {
+                label.textContent = "Файл не выбран";
+                return;
             }
+
+            const form = dropzone.closest("form");
+            const limit = fileLimitFor(form, input);
+
+            if (limit && input.files[0].size > limit) {
+                showToast(
+                    `❌ «${input.files[0].name}» (${fmtBytes(input.files[0].size)}) больше лимита ${fmtBytes(limit)} — выбери файл меньше`,
+                    "error",
+                    8000
+                );
+                label.textContent = `Файл не выбран (лимит ${fmtBytes(limit)})`;
+                input.value = "";
+                return;
+            }
+
+            const sizeInfo = limit
+                ? ` (${fmtBytes(input.files[0].size)})`
+                : "";
+            label.textContent = input.files[0].name + sizeInfo;
         });
     });
 }
@@ -189,6 +234,19 @@ function initUploads() {
 
         form.addEventListener("submit", (event) => {
             event.preventDefault();
+
+            const fileInput = form.querySelector("input[type=file]");
+            if (fileInput && fileInput.files.length) {
+                const limit = fileLimitFor(form, fileInput);
+                if (limit && fileInput.files[0].size > limit) {
+                    showToast(
+                        `❌ Файл (${fmtBytes(fileInput.files[0].size)}) больше лимита ${fmtBytes(limit)}`,
+                        "error",
+                        8000
+                    );
+                    return;
+                }
+            }
 
             const button = form.querySelector("button[type=submit]");
             const oldText = button ? button.textContent : "";

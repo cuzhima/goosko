@@ -443,6 +443,7 @@ def inject_globals():
     return {
         "public_base_url": PUBLIC_BASE_URL,
         "user_quota": USER_QUOTA,
+        "max_file_size": MAX_FILE_SIZE,
     }
 
 
@@ -1508,7 +1509,12 @@ def upload_big(token):
     user_admin = bool(user_row["is_admin"])
 
     if request.method == "GET":
-        return render_template("upload_big.html", token=token, user=username)
+        return render_template(
+            "upload_big.html",
+            token=token,
+            user=username,
+            quota_remaining=None if user_admin else quota_remaining(username),
+        )
 
     if "file" not in request.files or request.files["file"].filename == "":
         return "❌ Файл не выбран", 400

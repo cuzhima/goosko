@@ -8,8 +8,8 @@
 
     <p class="muted">
         Пользователь: {{ user }}.<br>
-        Лимит: 4 ГБ.<br>
-        Канал идёт мимо Cloudflare — напрямую на сервер.
+        Лимит: {{ (max_file_size / (1024*1024*1024)) | round(1) }} ГБ{% if quota_remaining is not none %} · свободно {{ quota_remaining | human_size }}{% endif %}.<br>
+        Загрузка идёт через goosko.online (Cloudflare).
     </p>
 
     <form
@@ -17,6 +17,8 @@
         action="{{ request.path }}"
         enctype="multipart/form-data"
         data-upload-progress
+        data-max-size="{{ max_file_size }}"
+        {% if quota_remaining is not none %}data-quota-remaining="{{ quota_remaining }}"{% endif %}
     >
         <label class="file-drop" data-file-drop>
             <span>Перетащи файл сюда или нажми для выбора</span>

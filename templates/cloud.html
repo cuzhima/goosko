@@ -24,6 +24,8 @@
             enctype="multipart/form-data"
             data-upload-progress
             data-redirect="/cloud"
+            data-max-size="{{ max_file_size }}"
+            data-quota-remaining="{{ [user_quota - usage, 0] | max }}"
         >
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
