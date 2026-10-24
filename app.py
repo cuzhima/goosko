@@ -1109,6 +1109,18 @@ def error_500(e):
 
 @app.errorhandler(CSRFError)
 def csrf_error(e):
+    try:
+        app.logger.warning(
+            "CSRF fail: reason=%r host=%s secure=%s cookies=%s "
+            "session_keys=%s form_has_token=%s header_token=%s referer=%s",
+            getattr(e, "description", ""), request.host, request.is_secure,
+            list(request.cookies.keys()), list(session.keys()),
+            "csrf_token" in request.form,
+            request.headers.get("X-CSRFToken"),
+            request.headers.get("Referer"),
+        )
+    except Exception:
+        pass
     return render_template(
         "error.html", code="400", icon="🧩",
         title="Ошибка CSRF",

@@ -1,1 +1,1 @@
-andrey ALL=(root) NOPASSWD: /usr/local/sbin/goosko-display, /usr/local/sbin/goosko-power, /usr/local/sbin/goosko-disk-tune
+andrey ALL=(root) NOPASSWD: /usr/local/sbin/goosko-display, /usr/local/sbin/goosko-power, /usr/local/sbin/goosko-disk-tune, /usr/local/sbin/goosko-funnel, /usr/local/bin/goosko-ssh-sign.sh, /usr/local/bin/goosko-ssh-revoke.sh
