@@ -28,7 +28,7 @@ import subprocess
 import tempfile
 import mimetypes
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 
 # =====================================================================
@@ -89,6 +89,13 @@ TOKEN_TTL = int(os.environ.get("UPLOAD_TOKEN_TTL", 3600))
 SHARE_TTL_HOURS = int(os.environ.get("SHARE_TTL_HOURS", 24))
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://goosko.online").rstrip("/")
+PUBLIC_DOMAIN = ".goosko.online"  # домен cookie при входе через Cloudflare
+try:
+    _pd = urlsplit(PUBLIC_BASE_URL).hostname
+    if _pd:
+        PUBLIC_DOMAIN = "." + _pd
+except (ValueError, AttributeError):
+    pass
 
 USE_X_ACCEL = os.environ.get("USE_X_ACCEL", "1") == "1"
 
@@ -153,18 +160,24 @@ class DynamicCookieSessionInterface(SecureCookieSessionInterface):
     """Домен и Secure считаются по реальному Host, без гонки app.config."""
 
     def get_cookie_domain(self, app):
+        # Запрос пришёл через Cloudflare → Host может быть переписан (origin
+        # rule). Cookie ставим на публичный домен, иначе браузер отбросит его.
+        if request.headers.get("Cf-Ray"):
+            return PUBLIC_DOMAIN
         try:
             host = request.host.split(":")[0].lower()
         except RuntimeError:
             return app.config.get("SESSION_COOKIE_DOMAIN")
         if host == "goosko.online" or host.endswith(".goosko.online"):
-            return ".goosko.online"
+            return PUBLIC_DOMAIN
         if host.endswith(".ts.net"):
             return host
         return None
 
     def get_cookie_secure(self, app):
         try:
+            if request.headers.get("Cf-Ray"):
+                return True
             host = request.host.split(":")[0].lower()
             if host == "goosko.online" or host.endswith(".goosko.online"):
                 return True
