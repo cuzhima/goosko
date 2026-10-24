@@ -3,20 +3,31 @@
 {% block title %}Админ-панель | ГОО СКО{% endblock %}
 
 {% block content %}
-<h1>⚙️ Панель управления</h1>
-<p class="muted">Добро пожаловать, {{ session['user'] }}!</p>
+<div class="page-head">
+    <div>
+        <h1>⚙️ Панель управления</h1>
+        <p class="muted">Добро пожаловать, {{ session['user'] }}!</p>
+    </div>
+
+    <div class="file-actions">
+        <a class="btn" href="{{ url_for('admin_stats') }}">📊 Статистика</a>
+        <a class="btn" href="{{ url_for('admin_activity') }}">📜 Журнал</a>
+        <a class="btn" href="{{ url_for('cloud_trash') }}">🗑️ Корзина</a>
+        <a class="btn primary" href="{{ url_for('cloud') }}">☁️ Облако</a>
+    </div>
+</div>
 
 <div class="grid">
     <div class="card">
         <h2>💻 Termix</h2>
         <p>Веб-терминал для управления.</p>
-        <a class="btn" href="https://termix.goosko.online/" target="_blank" rel="noopener">Открыть</a>
+        <a class="btn" href="/__termix__/">Открыть</a>
     </div>
 
     <div class="card">
         <h2>📊 Cockpit</h2>
         <p>Мониторинг сервера.</p>
-        <a class="btn" href="https://admin.goosko.online/" target="_blank" rel="noopener">Открыть</a>
+        <a class="btn" href="/__cockpit__/">Открыть</a>
     </div>
 
     <div class="card">
@@ -75,16 +86,16 @@
             <tbody>
                 {% for u in users %}
                 <tr>
-                    <td>🧑 {{ u.username }}</td>
-                    <td>
+                    <td data-label="Пользователь">🧑 {{ u.username }}</td>
+                    <td data-label="Роль">
                         {% if u.is_admin %}
                             <span class="badge ok">Admin</span>
                         {% else %}
                             <span class="badge">User</span>
                         {% endif %}
                     </td>
-                    <td>{{ u.usage|human_size }}</td>
-                    <td class="file-actions">
+                    <td data-label="Занято">{{ u.usage|human_size }}</td>
+                    <td data-label="Действия" class="file-actions">
                         {% if u.username != 'admin' and u.username != session['user'] %}
                             <form
                                 method="post"

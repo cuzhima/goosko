@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+
+{% block title %}Нет соединения | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="card auth-card">
+    <h1>📡 Нет соединения</h1>
+    <p class="muted">
+        Похоже, интернет пропал. Проверьте подключение и попробуйте снова.
+    </p>
+    <button class="btn primary" type="button" data-retry>🔄 Повторить</button>
+</div>
+{% endblock %}

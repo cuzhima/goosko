@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block title %}Журнал активности | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>📜 Журнал активности</h1>
+        <p class="muted">Всего событий: {{ total }}</p>
+    </div>
+
+    <a class="btn" href="{{ url_for('index') }}">← В панель</a>
+</div>
+
+<div class="card">
+    <form class="filter-form" method="get" action="{{ url_for('admin_activity') }}">
+        <div class="filter-grid">
+            <label class="field">
+                Пользователь
+                <select name="user">
+                    <option value="">Все пользователи</option>
+                    {% for name in usernames %}
+                        <option value="{{ name }}" {% if name == username %}selected{% endif %}>{{ name }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+
+            <label class="field">
+                Действие
+                <select name="action">
+                    <option value="">Все действия</option>
+                    {% for item in actions %}
+                        <option value="{{ item }}" {% if item == action %}selected{% endif %}>
+                            {{ action_labels.get(item, item) }}
+                        </option>
+                    {% endfor %}
+                </select>
+            </label>
+        </div>
+
+        <div class="file-actions">
+            <button class="btn primary" type="submit">🔎 Применить</button>
+            {% if action or username %}
+                <a class="btn" href="{{ url_for('admin_activity') }}">Сбросить</a>
+            {% endif %}
+        </div>
+    </form>
+</div>
+
+<div class="card">
+    {% if rows %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Когда</th>
+                        <th>Пользователь</th>
+                        <th>Действие</th>
+                        <th>Детали</th>
+                        <th>IP</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in rows %}
+                    <tr>
+                        <td data-label="#">{{ row['id'] }}</td>
+                        <td data-label="Когда">{{ row['created_at'] }}</td>
+                        <td data-label="Пользователь">{{ row['username'] or '—' }}</td>
+                        <td data-label="Действие">
+                            <span class="badge">{{ action_labels.get(row['action'], row['action']) }}</span>
+                        </td>
+                        <td data-label="Детали" class="event-details">{{ row['details'] or '' }}</td>
+                        <td data-label="IP"><code>{{ row['ip'] or '—' }}</code></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="pagination">
+            {% if page > 1 %}
+                <a class="btn small" href="{{ url_for('admin_activity', action=action, user=username, page=page-1) }}">← Назад</a>
+            {% endif %}
+
+            <span class="muted">Страница {{ page }} из {{ pages }}</span>
+
+            {% if page < pages %}
+                <a class="btn small" href="{{ url_for('admin_activity', action=action, user=username, page=page+1) }}">Вперёд →</a>
+            {% endif %}
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <span>📭</span>
+            <p>Событий не найдено.</p>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}

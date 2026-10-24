@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Ошибка: нужен root" >&2
+    exit 1
+fi
+
+PROFILE_FILE="/etc/goosko/power_profile"
+
+write_value() {
+    local path="$1" value="$2"
+    [ -w "$path" ] || return 0
+    printf '%s\n' "$value" > "$path" 2>/dev/null || true
+}
+
+apply_profile() {
+    local profile="$1"
+    local governor epp turbo maxfreq
+
+    case "$profile" in
+        eco)
+            governor="powersave"
+            epp="power"
+            turbo=1
+            ;;
+        balanced)
+            governor="powersave"
+            epp="balance_performance"
+            turbo=0
+            ;;
+        performance)
+            governor="performance"
+            epp="performance"
+            turbo=0
+            ;;
+        *)
+            echo "Неизвестный профиль: $profile" >&2
+            exit 2
+            ;;
+    esac
+
+    maxfreq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || true)
+
+    write_value /sys/devices/system/cpu/intel_pstate/no_turbo "$turbo"
+
+    if [ -n "$maxfreq" ]; then
+        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
+            write_value "$f" "$maxfreq"
+        done
+    fi
+
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+        write_value "$f" "$epp"
+    done
+
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        write_value "$f" "$governor"
+    done
+
+    mkdir -p "$(dirname "$PROFILE_FILE")"
+    printf '%s\n' "$profile" > "$PROFILE_FILE"
+    echo "profile=$profile governor=$governor epp=$epp no_turbo=$turbo"
+}
+
+ACTION="${1:-status}"
+
+case "$ACTION" in
+    apply|auto)
+        profile=$(cat "$PROFILE_FILE" 2>/dev/null || echo eco)
+        apply_profile "$profile"
+        ;;
+    eco|balanced|performance)
+        apply_profile "$ACTION"
+        ;;
+    status)
+        echo "profile=$(cat "$PROFILE_FILE" 2>/dev/null || echo unknown)"
+        echo "governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)"
+        echo "epp=$(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null || echo unknown)"
+        echo "no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo n/a)"
+        ;;
+    *)
+        echo "Использование: $0 {apply|eco|balanced|performance|status}" >&2
+        exit 2
+        ;;
+esac

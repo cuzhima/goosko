@@ -4,7 +4,16 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}ГОО СКО{% endblock %}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+    <meta name="theme-color" content="#2563eb" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="ГОО СКО">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
+    <link rel="manifest" href="{{ url_for('web_manifest') }}">
+    <link rel="icon" href="{{ url_for('static', filename='icons/icon-192.png', v='20261024c') }}" type="image/png">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/apple-touch-icon.png', v='20261024c') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20261024e') }}">
+    <script src="{{ url_for('static', filename='theme.js', v='20261024c') }}"></script>
 </head>
 <body>
     <a class="skip-link" href="#main">Перейти к содержимому</a>
@@ -13,18 +22,40 @@
         <div class="container topbar-inner">
             <a class="brand" href="/">ГОО СКО</a>
 
-            <nav class="nav">
-                {% if session.get('user') %}
-                    <a href="/">Панель</a>
-                    <a href="/cloud">Облако</a>
-                    <a href="/account">Аккаунт</a>
-		    <a href="/ssh">🔐 SSH</a>
-                    <form method="post" action="{{ url_for('logout') }}" class="inline-form">
-                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <button class="btn small" type="submit">Выйти</button>
-                    </form>
-                {% endif %}
-            </nav>
+            <button class="menu-toggle" type="button" data-menu-toggle
+                    aria-controls="main-nav" aria-expanded="false" aria-label="Открыть меню">
+                ☰
+            </button>
+
+            <div class="topbar-actions" id="main-nav">
+                <nav class="nav" aria-label="Основная навигация">
+                    {% if session.get('user') %}
+                        <a class="{{ 'active' if request.endpoint == 'index' else '' }}" href="/">Панель</a>
+                        <a class="{{ 'active' if request.endpoint in ('cloud', 'cloud_upload', 'cloud_biglink') else '' }}" href="/cloud">Облако</a>
+                        <a class="{{ 'active' if request.endpoint in ('cloud_trash', 'restore_file', 'purge_file', 'empty_trash') else '' }}" href="{{ url_for('cloud_trash') }}">Корзина</a>
+                        <a class="{{ 'active' if request.endpoint == 'account' else '' }}" href="/account">Аккаунт</a>
+                        {% if session.get('is_admin') %}
+                            <a class="{{ 'active' if request.endpoint == 'admin_stats' else '' }}" href="{{ url_for('admin_stats') }}">Статистика</a>
+                            <a class="{{ 'active' if request.endpoint in ('ssh_page', 'ssh_generate', 'ssh_download') else '' }}" href="/ssh">SSH</a>
+                            <a class="{{ 'active' if request.endpoint == 'admin_activity' else '' }}" href="{{ url_for('admin_activity') }}">Журнал</a>
+                            <a class="{{ 'active' if request.endpoint == 'system_page' else '' }}" href="{{ url_for('system_page') }}">Система</a>
+                        {% endif %}
+                    {% endif %}
+                </nav>
+
+                <div class="topbar-tools">
+                    <button class="icon-btn" type="button" data-theme-toggle aria-label="Переключить тему" title="Тема">
+                        <span data-theme-icon>🌓</span>
+                    </button>
+
+                    {% if session.get('user') %}
+                        <form method="post" action="{{ url_for('logout') }}" class="inline-form">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button class="btn small" type="submit">Выйти</button>
+                        </form>
+                    {% endif %}
+                </div>
+            </div>
         </div>
     </header>
 
@@ -42,6 +73,9 @@
         {% block content %}{% endblock %}
     </main>
 
-    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+    <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="{{ url_for('static', filename='app.js', v='20261024c') }}" defer></script>
+    {% block scripts %}{% endblock %}
 </body>
 </html>

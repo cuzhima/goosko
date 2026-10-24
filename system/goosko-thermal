@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Термоконтроль и сбор статуса для goosko.online."""
+
+import glob
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG_PATH = "/etc/goosko/thermal.conf"
+PROFILE_PATH = "/etc/goosko/power_profile"
+RUN_DIR = "/run/goosko"
+STATUS_PATH = os.path.join(RUN_DIR, "system.json")
+
+DEFAULT_CONFIG = {
+    "HIGH_TEMP": 78.0,
+    "RESUME_TEMP": 68.0,
+    "CRITICAL_TEMP": 90.0,
+    "INTERVAL": 10,
+    "SMART_INTERVAL": 60,
+    "DISK": "/dev/sda",
+}
+
+GOVERNORS = {
+    "eco": "powersave",
+    "balanced": "powersave",
+    "performance": "performance",
+}
+EPP = {
+    "eco": "power",
+    "balanced": "balance_performance",
+    "performance": "performance",
+}
+TURBO = {"eco": 1, "balanced": 0, "performance": 0}
+
+RUNNING = True
+STATE = {"thermal": "normal", "applied_profile": None}
+DISK_CACHE = {"at": 0.0, "data": {}}
+
+
+def log(message):
+    print(f"[goosko-thermal] {message}", flush=True)
+
+
+def read_text(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path, default=None):
+    value = read_text(path)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def write_text(path, value):
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(str(value))
+    except OSError:
+        pass
+
+
+def run_cmd(args, timeout=10):
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+        return (result.stdout or "") + (result.stderr or "")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().upper()
+                value = value.strip()
+                if key in ("HIGH_TEMP", "RESUME_TEMP", "CRITICAL_TEMP"):
+                    config[key] = float(value)
+                elif key in ("INTERVAL", "SMART_INTERVAL"):
+                    config[key] = max(2, int(float(value)))
+                elif key == "DISK":
+                    config[key] = value
+    except (OSError, ValueError):
+        pass
+    return config
+
+
+def cpu_temp():
+    for entry in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read_text(os.path.join(entry, "name")) != "coretemp":
+            continue
+        value = read_int(os.path.join(entry, "temp1_input"))
+        if value is not None:
+            return round(value / 1000.0, 1)
+    for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
+        kind = read_text(os.path.join(zone, "type"))
+        if kind not in ("x86_pkg_temp", "cpu-thermal"):
+            continue
+        value = read_int(os.path.join(zone, "temp"))
+        if value is not None:
+            return round(value / 1000.0, 1)
+    return None
+
+
+def cpu_model():
+    for line in (read_text("/proc/cpuinfo", "") or "").splitlines():
+        if line.lower().startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def backlight_state():
+    devices = []
+    for name in sorted(glob.glob("/sys/class/backlight/*")):
+        cur = read_int(os.path.join(name, "brightness"))
+        mx = read_int(os.path.join(name, "max_brightness"))
+        if cur is None or not mx:
+            continue
+        devices.append({
+            "name": os.path.basename(name),
+            "brightness": cur,
+            "max": mx,
+            "percent": max(0, min(100, round(cur * 100 / mx))),
+        })
+    return devices
+
+
+def service_state(unit):
+    result = run_cmd(["systemctl", "is-active", unit], timeout=4).strip()
+    return result or "unknown"
+
+
+def current_profile():
+    profile = (read_text(PROFILE_PATH, "eco") or "eco").strip().lower()
+    return profile if profile in GOVERNORS else "eco"
+
+
+def apply_profile(profile):
+    profile = profile if profile in GOVERNORS else "eco"
+    write_text("/sys/devices/system/cpu/intel_pstate/no_turbo", TURBO[profile])
+
+    maxfreq = read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+    if maxfreq:
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq"):
+            write_text(path, maxfreq)
+
+    for path in glob.glob(
+        "/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
+    ):
+        write_text(path, EPP[profile])
+
+    for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"):
+        write_text(path, GOVERNORS[profile])
+
+    STATE["applied_profile"] = profile
+
+
+def apply_thermal(level):
+    if level == "hot":
+        write_text("/sys/devices/system/cpu/intel_pstate/no_turbo", 1)
+        cap = read_int("/sys/devices/system/cpu/cpu0/cpufreq/base_frequency")
+        cap = cap or 2200000
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq"):
+            write_text(path, cap)
+        for path in glob.glob(
+            "/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
+        ):
+            write_text(path, "power")
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"):
+            write_text(path, "powersave")
+    elif level == "critical":
+        write_text("/sys/devices/system/cpu/intel_pstate/no_turbo", 1)
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq"):
+            write_text(path, 1200000)
+        for path in glob.glob(
+            "/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference"
+        ):
+            write_text(path, "power")
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"):
+            write_text(path, "powersave")
+    else:
+        apply_profile(current_profile())
+
+
+def decide_thermal(temp, current):
+    config = load_config()
+    if temp is None:
+        return current if current in ("hot", "critical") else "unknown"
+    if temp >= config["CRITICAL_TEMP"]:
+        return "critical"
+    if temp >= config["HIGH_TEMP"]:
+        return "hot"
+    if current in ("hot", "critical") and temp > config["RESUME_TEMP"]:
+        return current
+    return "normal"
+
+
+def collect_disk(config):
+    now = time.time()
+    if now - DISK_CACHE["at"] < config["SMART_INTERVAL"] and DISK_CACHE["data"]:
+        return DISK_CACHE["data"]
+
+    dev = config["DISK"]
+    name = os.path.basename(dev)
+    info = {
+        "dev": dev,
+        "model": read_text(f"/sys/block/{name}/device/model"),
+        "rotational": read_text(f"/sys/block/{name}/queue/rotational") == "1",
+    }
+
+    scheduler = read_text(f"/sys/block/{name}/queue/scheduler", "") or ""
+    match = re.search(r"\[([^\]]+)\]", scheduler)
+    info["scheduler"] = (
+        match.group(1) if match else (scheduler.split()[-1] if scheduler else None)
+    )
+
+    apm_output = run_cmd(["hdparm", "-B", dev])
+    match = re.search(r"APM_level\s*=\s*(\d+)", apm_output)
+    info["apm"] = int(match.group(1)) if match else None
+
+    smart_output = run_cmd(["smartctl", "-A", "-j", dev], timeout=15)
+    try:
+        smart = json.loads(smart_output)
+    except ValueError:
+        smart = {}
+
+    info["model"] = smart.get("model_name") or info.get("model")
+    info["temp"] = (smart.get("temperature") or {}).get("current")
+    info["power_on_hours"] = (smart.get("power_on_time") or {}).get("hours")
+    info["smart_status"] = (smart.get("smart_status") or {}).get("passed")
+
+    attrs = {}
+    for item in (smart.get("ata_smart_attributes") or {}).get("table", []):
+        if isinstance(item, dict) and item.get("id") is not None:
+            attrs[item["id"]] = item
+
+    def raw(attr_id):
+        item = attrs.get(attr_id)
+        if not item:
+            return None
+        return (item.get("raw") or {}).get("value")
+
+    info["load_cycles"] = raw(193)
+    info["power_cycles"] = raw(12)
+    info["reallocated"] = raw(5)
+    info["pending"] = raw(197)
+    info["crc_errors"] = raw(199)
+
+    DISK_CACHE["at"] = now
+    DISK_CACHE["data"] = info
+    return info
+
+
+def collect_status(config, thermal):
+    load1 = None
+    try:
+        load1 = round(os.getloadavg()[0], 2)
+    except OSError:
+        pass
+
+    cur_freq = read_int("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+    max_freq = read_int("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+
+    return {
+        "updated": int(time.time()),
+        "cpu": {
+            "model": cpu_model(),
+            "temp": cpu_temp(),
+            "load1": load1,
+            "freq_mhz": round(cur_freq / 1000) if cur_freq else None,
+            "max_mhz": round(max_freq / 1000) if max_freq else None,
+            "governor": read_text(
+                "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+            ),
+            "epp": read_text(
+                "/sys/devices/system/cpu/cpu0/cpufreq/"
+                "energy_performance_preference"
+            ),
+            "no_turbo": read_int(
+                "/sys/devices/system/cpu/intel_pstate/no_turbo"
+            ),
+            "profile": current_profile(),
+            "thermal": thermal,
+        },
+        "disk": collect_disk(config),
+        "display": {
+            "lightdm": service_state("lightdm.service"),
+            "backlight": backlight_state(),
+        },
+        "config": {
+            "high_temp": config["HIGH_TEMP"],
+            "resume_temp": config["RESUME_TEMP"],
+            "critical_temp": config["CRITICAL_TEMP"],
+        },
+    }
+
+
+def write_status(status):
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        os.chmod(RUN_DIR, 0o755)
+    except OSError:
+        pass
+    tmp = STATUS_PATH + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(status, fh, ensure_ascii=False)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, STATUS_PATH)
+    except OSError:
+        pass
+
+
+def handle_signal(signum, frame):
+    global RUNNING
+    void = (signum, frame)
+    RUNNING = False
+
+
+def main():
+    if "--once" in sys.argv:
+        config = load_config()
+        print(json.dumps(collect_status(config, STATE["thermal"]),
+                         ensure_ascii=False, indent=2))
+        return 0
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    config = load_config()
+    log(
+        f"запущен: high={config['HIGH_TEMP']}°C "
+        f"critical={config['CRITICAL_TEMP']}°C "
+        f"resume={config['RESUME_TEMP']}°C disk={config['DISK']}"
+    )
+
+    while RUNNING:
+        config = load_config()
+        temp = cpu_temp()
+        new_state = decide_thermal(temp, STATE["thermal"])
+
+        if new_state != STATE["thermal"]:
+            log(f"температура {temp}°C: {STATE['thermal']} -> {new_state}")
+            apply_thermal(new_state)
+            STATE["thermal"] = new_state
+        elif new_state == "normal":
+            profile = current_profile()
+            if STATE["applied_profile"] != profile:
+                log(f"профиль питания: {profile}")
+                apply_profile(profile)
+
+        write_status(collect_status(config, STATE["thermal"]))
+
+        for _ in range(config["INTERVAL"]):
+            if not RUNNING:
+                break
+            time.sleep(1)
+
+    log("остановлен")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

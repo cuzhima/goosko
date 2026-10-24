@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}{{ file.name }} | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>👁️ {{ file.name }}</h1>
+        <p class="muted">
+            {{ '🌐 Публичная зона' if file.zone == 'public' else '🔒 Приватная зона' }}
+            · {{ file.size|human_size }}
+            · {{ file.created_at }}
+        </p>
+    </div>
+
+    <div class="file-actions">
+        <a class="btn primary" href="{{ download_url }}">📥 Скачать</a>
+        <a class="btn" href="{{ url_for('cloud') }}">← В облако</a>
+    </div>
+</div>
+
+<div class="card preview-card">
+    {% if kind == 'image' %}
+        <img class="preview-media" src="{{ raw_url }}" alt="{{ file.name }}">
+    {% elif kind == 'video' %}
+        <video class="preview-media" controls preload="metadata" src="{{ raw_url }}">
+            Ваш браузер не поддерживает видео.
+        </video>
+    {% elif kind == 'audio' %}
+        <audio class="preview-audio" controls preload="metadata" src="{{ raw_url }}">
+            Ваш браузер не поддерживает аудио.
+        </audio>
+    {% elif kind == 'pdf' %}
+        <div class="empty-state">
+            <span>📄</span>
+            <p>PDF-файл готов к просмотру.</p>
+            <a class="btn primary" href="{{ raw_url }}" target="_blank" rel="noopener">Открыть PDF</a>
+        </div>
+    {% elif kind == 'text' %}
+        <pre class="preview-text" data-preview-text="{{ raw_url }}">Загрузка…</pre>
+    {% endif %}
+</div>
+{% endblock %}

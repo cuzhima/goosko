@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+
+{% block title %}Система | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>🖥️ Система</h1>
+        <p class="muted">Экран, питание, диск и термоконтроль. Данные обновляются автоматически.</p>
+    </div>
+
+    <div class="file-actions">
+        <a class="btn" href="{{ url_for('admin_stats') }}">📊 Статистика</a>
+        <button class="btn" type="button" data-system-action="disk_tune">💾 Настроить диск</button>
+    </div>
+</div>
+
+<div class="card sys-note" id="sys-stale" hidden>
+    <strong>⚠️ Монитор системы не запущен.</strong>
+    <span>Данные SMART и термоконтроль появятся после установки:</span>
+    <code>sudo system/install.sh</code>
+</div>
+
+<div class="card sys-note" id="sys-helpers" hidden>
+    <strong>⚠️ Не установлены системные помощники.</strong>
+    <span>Управление экраном, питанием и диском заработает после:</span>
+    <code>sudo system/install.sh</code>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-label">🌡️ CPU</span>
+        <strong id="cpu-temp" class="temp-value">—</strong>
+        <span class="muted" id="cpu-thermal">—</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">⚡ Частота</span>
+        <strong id="cpu-freq">—</strong>
+        <span class="muted" id="cpu-max">—</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">📈 Нагрузка</span>
+        <strong id="cpu-load">—</strong>
+        <span class="muted">load average 1 мин</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">💾 Диск</span>
+        <strong id="disk-temp" class="temp-value">—</strong>
+        <span class="muted" id="disk-model-short">—</span>
+    </div>
+</div>
+
+<div class="grid two">
+    <div class="card">
+        <h2>🔋 Процессор и питание</h2>
+        <dl class="sys-list">
+            <div><dt>Модель</dt><dd id="cpu-model">—</dd></div>
+            <div><dt>Governor</dt><dd id="cpu-governor">—</dd></div>
+            <div><dt>EPP</dt><dd id="cpu-epp">—</dd></div>
+            <div><dt>Turbo</dt><dd id="cpu-turbo">—</dd></div>
+            <div><dt>Текущий профиль</dt><dd id="cpu-profile">—</dd></div>
+        </dl>
+
+        <div class="file-actions">
+            <button class="btn" type="button" data-system-action="power_eco">🌱 Eco</button>
+            <button class="btn" type="button" data-system-action="power_balanced">⚖️ Balanced</button>
+            <button class="btn" type="button" data-system-action="power_performance">🚀 Performance</button>
+        </div>
+        <p class="muted">Eco отключает турбо и экономит энергию, Performance — максимум скорости.</p>
+    </div>
+
+    <div class="card">
+        <h2>💾 Диск</h2>
+        <dl class="sys-list">
+            <div><dt>Устройство</dt><dd id="disk-dev">—</dd></div>
+            <div><dt>Модель</dt><dd id="disk-model">—</dd></div>
+            <div><dt>Load cycles</dt><dd id="disk-cycles">—</dd></div>
+            <div><dt>Power-on</dt><dd id="disk-hours">—</dd></div>
+            <div><dt>APM</dt><dd id="disk-apm">—</dd></div>
+            <div><dt>Планировщик</dt><dd id="disk-sched">—</dd></div>
+            <div><dt>SMART</dt><dd id="disk-smart">—</dd></div>
+        </dl>
+        <p class="muted">APM=254 и отключённый standby уменьшают парковку головок. Для SMR это важнее экономии энергии.</p>
+    </div>
+</div>
+
+<div class="grid two">
+    <div class="card">
+        <h2>🖥️ Экран</h2>
+        <p>Состояние: <strong id="display-state">—</strong></p>
+        <p>Подсветка: <strong id="display-brightness">—</strong></p>
+
+        <div class="file-actions">
+            <button class="btn primary" type="button" data-system-action="display_on">Включить</button>
+            <button class="btn danger" type="button" data-system-action="display_off">Выключить</button>
+        </div>
+
+        <div class="range-row">
+            <label for="brightness-range">Яркость</label>
+            <input id="brightness-range" type="range" min="0" max="100" step="5" value="100">
+            <button class="btn small" type="button" id="brightness-apply">Применить</button>
+        </div>
+        <p class="muted">Выключение останавливает LightDM и гасит подсветку, сервер продолжает работать.</p>
+    </div>
+
+    <div class="card">
+        <h2>🌡️ Термоконтроль</h2>
+        <p>Состояние: <strong id="thermal-state">—</strong></p>
+        <p class="muted" id="thermal-thresholds">Пороги: —</p>
+        <p class="muted">При нагреве демон снижает частоту и отключает турбо, после остывания возвращает выбранный профиль.</p>
+    </div>
+</div>
+
+<div class="card">
+    <h2>ℹ️ Обновление</h2>
+    <p class="muted">
+        Данные монитора: <span id="sys-updated">—</span> ·
+        сервер: <span id="sys-clock">—</span>
+    </p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='system.js', v='20261024d') }}" defer></script>
+{% endblock %}

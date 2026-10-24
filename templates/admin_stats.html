@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+
+{% block title %}Статистика | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>📊 Статистика</h1>
+        <p class="muted">Сводка по пользователям, файлам и активности.</p>
+    </div>
+
+    <div class="file-actions">
+        <form method="post" action="{{ url_for('admin_sync_public') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn" type="submit">🔄 Синхронизировать public</button>
+        </form>
+        <a class="btn" href="{{ url_for('index') }}">← В панель</a>
+    </div>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-label">👥 Пользователи</span>
+        <strong>{{ stats.users }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">📄 Файлы</span>
+        <strong>{{ stats.files }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">💾 Занято</span>
+        <strong>{{ stats.size|human_size }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">📥 Скачиваний</span>
+        <strong>{{ stats.downloads }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">📤 За 24 часа</span>
+        <strong>{{ stats.uploads_24h }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">🗑️ В корзине</span>
+        <strong>{{ stats.trash }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">🕒 Событий за 24 ч</span>
+        <strong>{{ stats.events_24h }}</strong>
+    </div>
+    <div class="stat-card">
+        <span class="stat-label">💽 Свободно на диске</span>
+        <strong>{{ stats.disk_free|human_size }}</strong>
+        <span class="muted">из {{ stats.disk_total|human_size }}</span>
+    </div>
+</div>
+
+<div class="card">
+    <h2>📜 Последние события</h2>
+
+    {% if recent_activity %}
+        <ul class="event-list">
+            {% for event in recent_activity %}
+                <li>
+                    <span class="badge">{{ action_labels.get(event['action'], event['action']) }}</span>
+                    <span class="event-user">{{ event['username'] or '—' }}</span>
+                    <span class="muted">{{ event['created_at'] }}</span>
+                    {% if event['details'] %}
+                        <span class="event-details">{{ event['details'] }}</span>
+                    {% endif %}
+                </li>
+            {% endfor %}
+        </ul>
+        <a class="btn small" href="{{ url_for('admin_activity') }}">Вся история</a>
+    {% else %}
+        <p class="muted">Событий пока нет.</p>
+    {% endif %}
+</div>
+{% endblock %}

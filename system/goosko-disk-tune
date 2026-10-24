@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Ошибка: нужен root" >&2
+    exit 1
+fi
+
+DEV="${1:-/dev/sda}"
+case "$DEV" in
+    /dev/sd[a-z]|/dev/vd[a-z]|/dev/nvme[0-9]*n[0-9]*) ;;
+    *)
+        echo "Недопустимое устройство: $DEV" >&2
+        exit 2
+        ;;
+esac
+
+for _ in $(seq 1 30); do
+    [ -b "$DEV" ] && break
+    sleep 1
+done
+
+if [ ! -b "$DEV" ]; then
+    echo "Устройство не найдено: $DEV" >&2
+    exit 1
+fi
+
+NAME=$(basename "$DEV")
+
+# Главное для SMR: не парковать головки при простое и не уходить в standby.
+# APM 254 = максимальная производительность без агрессивного энергосбережения.
+if hdparm -B 254 -S 0 "$DEV" >/tmp/goosko-hdparm.out 2>&1; then
+    echo "hdparm: APM=254, standby=off"
+else
+    echo "hdparm: не удалось применить APM/standby" >&2
+    sed 's/^/  /' /tmp/goosko-hdparm.out >&2 || true
+fi
+hdparm -W 1 "$DEV" >/dev/null 2>&1 || true
+
+SCHED="/sys/block/$NAME/queue/scheduler"
+if [ -w "$SCHED" ]; then
+    if grep -q '\[mq-deadline\]' "$SCHED"; then
+        echo "scheduler=mq-deadline"
+    elif grep -q 'bfq' "$SCHED"; then
+        echo bfq > "$SCHED" 2>/dev/null || true
+        echo "scheduler=bfq"
+    fi
+fi
+
+blockdev --setra 4096 "$DEV" >/dev/null 2>&1 && echo "readahead=4096"
+
+APM_LINE=$(hdparm -B "$DEV" 2>/dev/null | grep -i 'APM_level' || true)
+if [ -n "$APM_LINE" ]; then
+    echo "$APM_LINE"
+fi
+exit 0

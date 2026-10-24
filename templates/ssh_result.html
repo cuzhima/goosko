@@ -47,7 +47,7 @@
     <ol>
         <li>Termius → <strong>Keychain</strong> → <strong>Keys</strong> → Add → вставь приватный ключ, имя: <code>GOOSKO temp #{{ cert_id }}</code>.</li>
         <li>Termius → <strong>Keychain</strong> → <strong>Certificates</strong> (или настройки ключа) → Add → вставь сертификат.</li>
-        <li>Создай Host: адрес <code>{{ host_hint }}</code>, порт <code>22</code>, пользователь <code>{{ principal }}</code>.</li>
+        <li>Создай Host: адрес <code>{{ host_hint }}</code>, порт <code>{{ port }}</code>, пользователь <code>{{ principal }}</code>.</li>
         <li>В настройках Host → Authentication выбери ключ <code>GOOSKO temp #{{ cert_id }}</code> (сертификат подцепится автоматически).</li>
         <li>Connect. Готово до {{ expires }} UTC.</li>
     </ol>
@@ -57,7 +57,7 @@
     <h2>💻 Подключение из терминала</h2>
     <p>Положи оба файла в одну папку и выполни:</p>
     <pre>chmod 600 goosko_key
-ssh -i goosko_key -o CertificateFile=goosko_key-cert.pub {{ principal }}@{{ host_hint }}</pre>
+ssh -p {{ port }} -i goosko_key -o CertificateFile=goosko_key-cert.pub {{ principal }}@{{ host_hint }}</pre>
     <p class="muted">OpenSSH также подхватит сертификат автоматически, если файл лежит рядом с ключом и называется <code>goosko_key-cert.pub</code>.</p>
 </div>
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply Goosko CPU power profile
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/goosko-power apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -3,12 +3,16 @@
 {% block title %}Облако | ГОО СКО{% endblock %}
 
 {% block content %}
-<h1>☁️ Облачное хранилище</h1>
-
-<p class="muted">
-    Максимальный размер файла: 4 ГБ.<br>
-    Обычные пользователи имеют квоту 20 ГБ. Администраторы не ограничены.
-</p>
+<div class="page-head">
+    <div>
+        <h1>☁️ Облачное хранилище</h1>
+        <p class="muted">
+            Максимальный размер файла: 4 ГБ.<br>
+            Обычные пользователи имеют квоту 20 ГБ. Администраторы не ограничены.
+        </p>
+    </div>
+    <a class="btn" href="{{ url_for('cloud_trash') }}">🗑️ Корзина</a>
+</div>
 
 <div class="grid two">
     <div class="card">
@@ -81,23 +85,51 @@
             </div>
         {% endif %}
 
-        <form class="search-form" method="get" action="{{ url_for('cloud') }}">
+        <form class="filter-form" method="get" action="{{ url_for('cloud') }}">
             <label class="field">
                 Поиск файлов
                 <input type="search" name="q" value="{{ q }}" placeholder="Имя файла">
             </label>
 
-            <button class="btn" type="submit">Найти</button>
+            <div class="filter-grid">
+                <label class="field">
+                    Тип файла
+                    <select name="kind">
+                        {% for value, label in kind_labels.items() %}
+                            <option value="{{ value }}" {% if value == kind %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+
+                <label class="field">
+                    Сортировка
+                    <select name="sort">
+                        {% for value, label in sort_options.items() %}
+                            <option value="{{ value }}" {% if value == sort %}selected{% endif %}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+            </div>
+
+            <div class="file-actions">
+                <button class="btn primary" type="submit">🔎 Применить</button>
+                {% if q or kind != 'all' or sort != 'date_desc' %}
+                    <a class="btn" href="{{ url_for('cloud') }}">Сбросить</a>
+                {% endif %}
+            </div>
         </form>
 
-        {% if q %}
-            <p class="muted">Поиск: {{ q }}</p>
+        {% if q or kind != 'all' %}
+            <p class="muted">
+                {% if q %}Поиск: {{ q }}.{% endif %}
+                {% if kind != 'all' %}Тип: {{ kind_labels[kind] }}.{% endif %}
+            </p>
         {% endif %}
     </div>
 </div>
 
 <div class="card">
-    <h2>🌐 Публичная зона ({{ public_files|length }})</h2>
+    <h2>🌐 Публичная зона ({{ public_files|length }}) · {{ public_files|sum(attribute='size')|human_size }}</h2>
 
     {% if public_files %}
         <div class="table-wrap">
@@ -108,17 +140,22 @@
                         <th>Владелец</th>
                         <th>Размер</th>
                         <th>Создан</th>
+                        <th>Скачиваний</th>
                         <th>Действия</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for f in public_files %}
                     <tr>
-                        <td>🌐 {{ f.name }}</td>
-                        <td>{{ f.owner }}</td>
-                        <td>{{ f.size|human_size }}</td>
-                        <td>{{ f.created_at }}</td>
-                        <td class="file-actions">
+                        <td data-label="Файл">🌐 {{ f.name }}</td>
+                        <td data-label="Владелец">{{ f.owner }}</td>
+                        <td data-label="Размер">{{ f.size|human_size }}</td>
+                        <td data-label="Создан">{{ f.created_at }}</td>
+                        <td data-label="Скачиваний">{{ f.download_count }}</td>
+                        <td data-label="Действия" class="file-actions">
+                            {% if f.preview_kind %}
+                                <a class="btn small" href="{{ url_for('file_preview', file_id=f.id) }}" title="Предпросмотр">👁️</a>
+                            {% endif %}
                             <a class="btn small" href="{{ f.url }}" target="_blank" rel="noopener">Открыть</a>
                             <button class="btn small" type="button" data-copy="{{ f.full_url }}">📋 Копировать</button>
 
@@ -144,7 +181,7 @@
 </div>
 
 <div class="card">
-    <h2>🔒 Приватная зона ({{ private_files|length }})</h2>
+    <h2>🔒 Приватная зона ({{ private_files|length }}) · {{ private_files|sum(attribute='size')|human_size }}</h2>
 
     {% if private_files %}
         <div class="table-wrap">
@@ -157,22 +194,27 @@
                         {% endif %}
                         <th>Размер</th>
                         <th>Создан</th>
+                        <th>Скачиваний</th>
                         <th>Действия</th>
                     </tr>
                 </thead>
                 <tbody>
                     {% for f in private_files %}
                     <tr>
-                        <td>🔒 {{ f.name }}</td>
+                        <td data-label="Файл">🔒 {{ f.name }}</td>
 
                         {% if session.get('is_admin') %}
-                            <td>{{ f.owner }}</td>
+                            <td data-label="Владелец">{{ f.owner }}</td>
                         {% endif %}
 
-                        <td>{{ f.size|human_size }}</td>
-                        <td>{{ f.created_at }}</td>
+                        <td data-label="Размер">{{ f.size|human_size }}</td>
+                        <td data-label="Создан">{{ f.created_at }}</td>
+                        <td data-label="Скачиваний">{{ f.download_count }}</td>
 
-                        <td class="file-actions">
+                        <td data-label="Действия" class="file-actions">
+                            {% if f.preview_kind %}
+                                <a class="btn small" href="{{ url_for('file_preview', file_id=f.id) }}" title="Предпросмотр">👁️</a>
+                            {% endif %}
                             <a class="btn small" href="{{ f.url }}">📥 Скачать</a>
                             <button class="btn small" type="button" data-copy="{{ f.full_url }}">📋 Копировать</button>
 

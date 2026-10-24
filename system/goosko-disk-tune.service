@@ -1,0 +1,12 @@
+[Unit]
+Description=Goosko SMR-friendly disk tuning
+After=local-fs.target dev-sda.device
+Wants=dev-sda.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/goosko-disk-tune /dev/sda
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

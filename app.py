@@ -1,17 +1,19 @@
 from flask import (
     Flask, request, render_template, redirect, url_for,
-    session, flash, send_file, abort, g, Response,
+    session, flash, send_file, send_from_directory, abort, g, Response,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import safe_join
 from werkzeug.exceptions import HTTPException
+from flask.sessions import SecureCookieSessionInterface
 from flask_wtf.csrf import CSRFProtect, CSRFError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
 import sqlite3
 import functools
+import json
 import os
 import secrets
 import re
@@ -22,6 +24,7 @@ import time
 import shutil
 import subprocess
 import tempfile
+import mimetypes
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -40,12 +43,30 @@ class QuotaExceeded(Exception):
 # =====================================================================
 # ПУТИ И ХРАНИЛИЩЕ
 # =====================================================================
+def grant_nginx_access(path, default=False):
+    try:
+        subprocess.run(
+            ["setfacl", "-m", "u:www-data:rX", path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+        if default and os.path.isdir(path):
+            subprocess.run(
+                ["setfacl", "-m", "d:u:www-data:rX", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5, check=False,
+            )
+    except Exception:
+        pass
+
+
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     try:
         os.chmod(path, 0o750)
     except OSError:
         pass
+    grant_nginx_access(path, default=True)
 
 
 STORAGE_DIR = os.environ.get("STORAGE_DIR", "/var/www/storage")
@@ -73,6 +94,12 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://goosko.online").rst
 USE_X_ACCEL = os.environ.get("USE_X_ACCEL", "1") == "1"
 
 DB = os.environ.get("DB_PATH", "users.db")
+
+SYSTEM_STATUS_FILE = os.environ.get("SYSTEM_STATUS_FILE", "/run/goosko/system.json")
+DISPLAY_HELPER = os.environ.get("DISPLAY_HELPER", "/usr/local/sbin/goosko-display")
+POWER_HELPER = os.environ.get("POWER_HELPER", "/usr/local/sbin/goosko-power")
+DISK_HELPER = os.environ.get("DISK_HELPER", "/usr/local/sbin/goosko-disk-tune")
+HELPER_TIMEOUT = int(os.environ.get("HELPER_TIMEOUT", "30"))
 
 
 # =====================================================================
@@ -102,22 +129,39 @@ app.wsgi_app = ProxyFix(
     app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1
 )
 
+# =====================================================================
+# ДИНАМИЧЕСКИЕ COOKIE (goosko.online + Tailscale Funnel + локальный IP)
+# =====================================================================
+class DynamicCookieSessionInterface(SecureCookieSessionInterface):
+    """Домен и Secure считаются по реальному Host, без гонки app.config."""
+
+    def get_cookie_domain(self, app):
+        try:
+            host = request.host.split(":")[0].lower()
+        except RuntimeError:
+            return app.config.get("SESSION_COOKIE_DOMAIN")
+        if host == "goosko.online" or host.endswith(".goosko.online"):
+            return ".goosko.online"
+        if host.endswith(".ts.net"):
+            return host
+        return None
+
+    def get_cookie_secure(self, app):
+        try:
+            host = request.host.split(":")[0].lower()
+            if host == "goosko.online" or host.endswith(".goosko.online"):
+                return True
+            if host.endswith(".ts.net"):
+                return True
+            return request.is_secure
+        except RuntimeError:
+            return app.config.get("SESSION_COOKIE_SECURE", True)
+
+
+app.session_interface = DynamicCookieSessionInterface()
+
 csrf = CSRFProtect(app)
 limiter = Limiter(get_remote_address, app=app, storage_uri="memory://")
-
-
-# =====================================================================
-# ДИНАМИЧЕСКИЙ COOKIE_DOMAIN (для goosko.online + Tailscale Funnel)
-# =====================================================================
-@app.before_request
-def set_dynamic_cookie_domain():
-    host = request.host.split(":")[0]
-    if host == "goosko.online" or host.endswith(".goosko.online"):
-        app.config["SESSION_COOKIE_DOMAIN"] = ".goosko.online"
-    elif host.endswith(".ts.net"):
-        app.config["SESSION_COOKIE_DOMAIN"] = host
-    else:
-        app.config["SESSION_COOKIE_DOMAIN"] = None
 
 
 # =====================================================================
@@ -145,6 +189,77 @@ UNSAFE_PUBLIC_EXTENSIONS = {
 def is_safe_public_filename(filename):
     ext = os.path.splitext(filename)[1].lower()
     return ext not in UNSAFE_PUBLIC_EXTENSIONS
+
+
+PREVIEW_EXTENSIONS = {
+    "image": {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"},
+    "video": {".mp4", ".webm", ".ogv", ".mov", ".m4v"},
+    "audio": {".mp3", ".wav", ".ogg", ".oga", ".flac", ".m4a", ".aac", ".opus"},
+    "pdf": {".pdf"},
+    "text": {".txt", ".md", ".markdown", ".log", ".csv", ".json", ".yaml", ".yml"},
+}
+
+
+def preview_kind(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    for kind, extensions in PREVIEW_EXTENSIONS.items():
+        if ext in extensions:
+            return kind
+    return None
+
+
+FILE_KIND_GROUPS = {
+    "image": PREVIEW_EXTENSIONS["image"],
+    "video": PREVIEW_EXTENSIONS["video"],
+    "audio": PREVIEW_EXTENSIONS["audio"],
+    "text": PREVIEW_EXTENSIONS["text"],
+    "document": {
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".odt", ".ods", ".odp", ".rtf", ".epub",
+    },
+    "archive": {
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".iso",
+    },
+}
+
+FILE_KIND_LABELS = {
+    "all": "Все файлы",
+    "image": "Изображения",
+    "video": "Видео",
+    "audio": "Аудио",
+    "text": "Текст и данные",
+    "document": "Документы",
+    "archive": "Архивы",
+}
+
+FILE_SORT_OPTIONS = {
+    "date_desc": "Сначала новые",
+    "date_asc": "Сначала старые",
+    "name_asc": "Имя: А–Я",
+    "name_desc": "Имя: Я–А",
+    "size_desc": "Размер: больше",
+    "size_asc": "Размер: меньше",
+    "downloads_desc": "Популярные",
+}
+
+FILE_SORT_SQL = {
+    "date_desc": "created_at DESC, id DESC",
+    "date_asc": "created_at ASC, id ASC",
+    "name_asc": "original_name COLLATE NOCASE ASC",
+    "name_desc": "original_name COLLATE NOCASE DESC",
+    "size_desc": "size DESC, id DESC",
+    "size_asc": "size ASC, id ASC",
+    "downloads_desc": "download_count DESC, id DESC",
+}
+
+
+def file_kind_filter(kind):
+    extensions = FILE_KIND_GROUPS.get(kind)
+    if not extensions:
+        return "", []
+    clauses = " OR ".join("lower(original_name) LIKE ?" for _ in extensions)
+    params = [f"%{ext}" for ext in extensions]
+    return "(" + clauses + ")", params
 
 
 # =====================================================================
@@ -322,6 +437,28 @@ def audit(action, details=""):
         app.logger.exception("Audit failed")
 
 
+AUDIT_ACTION_LABELS = {
+    "login_success": "Вход",
+    "login_failed": "Неудачный вход",
+    "logout": "Выход",
+    "password_changed": "Смена пароля",
+    "upload": "Загрузка",
+    "upload_big": "Большая загрузка",
+    "biglink_created": "Ссылка для загрузки",
+    "share_created": "Создана ссылка",
+    "delete": "Удаление",
+    "restore": "Восстановление",
+    "purge": "Удаление навсегда",
+    "trash_emptied": "Очистка корзины",
+    "user_created": "Создан пользователь",
+    "user_deleted": "Удалён пользователь",
+    "ssh_cert_issued": "Выдан SSH-сертификат",
+    "ssh_cert_revoked": "Отозван SSH-сертификат",
+    "public_synced": "Синхронизация public",
+    "system_action": "Системная команда",
+}
+
+
 # =====================================================================
 # ДЕКОРАТОРЫ
 # =====================================================================
@@ -430,6 +567,17 @@ def can_access_private(current_user, is_admin, target_user):
     return bool(is_admin) or current_user == target_user
 
 
+def can_access_file_row(row):
+    if row["zone"] == "public":
+        return True
+    username = row["rel_path"].split("/", 1)[0]
+    return can_access_private(
+        session.get("user"),
+        session.get("is_admin", False),
+        username,
+    )
+
+
 # =====================================================================
 # ФАЙЛЫ В БД
 # =====================================================================
@@ -487,6 +635,72 @@ def upsert_file_record(owner, zone, rel_path, original_name, size):
     db.commit()
 
 
+PUBLIC_SYNC_INTERVAL = 60
+_public_sync_at = 0.0
+
+
+def sync_public_files(force=False):
+    global _public_sync_at
+
+    now = time.monotonic()
+    if not force and now - _public_sync_at < PUBLIC_SYNC_INTERVAL:
+        return 0
+    _public_sync_at = now
+
+    db = get_db()
+    usernames = {
+        r["username"] for r in db.execute("SELECT username FROM users").fetchall()
+    }
+    added = 0
+
+    for root, dirs, files in os.walk(PUBLIC_DIR, followlinks=False):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in files:
+            if name.startswith(".") or name.endswith(".part"):
+                continue
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+
+            rel_path = os.path.relpath(path, PUBLIC_DIR).replace(os.sep, "/")
+            existing = get_active_file_by_path("public", rel_path)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+
+            if existing:
+                if existing["size"] != stat.st_size:
+                    db.execute(
+                        "UPDATE files SET size=? WHERE id=?",
+                        (stat.st_size, existing["id"]),
+                    )
+                    db.commit()
+                continue
+
+            first = rel_path.split("/", 1)[0]
+            owner = first if "/" in rel_path and first in usernames else "admin"
+            grant_nginx_access(path)
+            created_at = dbnow(
+                datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+            )
+            try:
+                db.execute(
+                    "INSERT INTO files "
+                    "(owner, zone, rel_path, original_name, size, created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (owner, "public", rel_path, name, stat.st_size, created_at),
+                )
+                db.commit()
+                added += 1
+            except sqlite3.IntegrityError:
+                db.rollback()
+            except Exception:
+                db.rollback()
+                app.logger.exception("Failed to sync public file")
+    return added
+
+
 def increment_download(file_id):
     try:
         db = get_db()
@@ -529,11 +743,13 @@ def file_to_dict(row):
         "full_url": full_url,
         "share_full": share_full,
         "download_count": row["download_count"] or 0,
+        "preview_kind": preview_kind(name),
         "can_delete": bool(session.get("is_admin") or row["owner"] == session.get("user")),
     }
 
 
-def list_files(zone=None, owner=None, private_username=None, q=None):
+def list_files(zone=None, owner=None, private_username=None, q=None,
+               kind=None, sort="date_desc"):
     db = get_db()
     sql = "SELECT * FROM files WHERE deleted_at IS NULL"
     params = []
@@ -551,8 +767,14 @@ def list_files(zone=None, owner=None, private_username=None, q=None):
         sql += " AND (original_name LIKE ? OR rel_path LIKE ?)"
         like = f"%{q}%"
         params.extend([like, like])
+    if kind:
+        clause, kind_params = file_kind_filter(kind)
+        if clause:
+            sql += " AND " + clause
+            params.extend(kind_params)
 
-    sql += " ORDER BY created_at DESC LIMIT 1000"
+    order = FILE_SORT_SQL.get(sort, FILE_SORT_SQL["date_desc"])
+    sql += f" ORDER BY {order} LIMIT 1000"
     rows = db.execute(sql, params).fetchall()
     return [file_to_dict(r) for r in rows]
 
@@ -588,6 +810,7 @@ def save_upload_stream(stream, target_path, max_size=MAX_FILE_SIZE, quota_remain
             os.chmod(target_path, 0o640)
         except OSError:
             pass
+        grant_nginx_access(target_path)
         return size
     except Exception:
         if os.path.exists(tmp_path):
@@ -612,6 +835,7 @@ def move_file_record_to_trash(row):
                 os.chmod(trash_path, 0o640)
             except OSError:
                 pass
+            grant_nginx_access(trash_path)
         except Exception:
             app.logger.exception("Failed to move file to trash")
             return False
@@ -621,6 +845,90 @@ def move_file_record_to_trash(row):
         "UPDATE files SET deleted_at=?, trash_path=? WHERE id=?",
         (dbnow(), trash_name, row["id"]),
     )
+    db.commit()
+    return True
+
+
+def can_manage_file(row):
+    if session.get("is_admin"):
+        return True
+    return row["owner"] == session.get("user")
+
+
+def list_trash_files(include_all=False):
+    db = get_db()
+    sql = "SELECT * FROM files WHERE deleted_at IS NOT NULL"
+    params = []
+    if not include_all:
+        sql += " AND owner = ?"
+        params.append(session.get("user"))
+    sql += " ORDER BY deleted_at DESC LIMIT 1000"
+    rows = db.execute(sql, params).fetchall()
+    result = []
+    for row in rows:
+        item = file_to_dict(row)
+        item["deleted_at"] = row["deleted_at"] or ""
+        item["trash_name"] = row["trash_path"] or ""
+        result.append(item)
+    return result
+
+
+def trash_physical_path(row):
+    if not row["trash_path"]:
+        return None
+    return resolve_storage_path(TRASH_DIR, row["trash_path"])
+
+
+def restore_file_record(row):
+    base_dir = PRIVATE_DIR if row["zone"] == "private" else PUBLIC_DIR
+    trash_file = trash_physical_path(row)
+    if not trash_file or not os.path.isfile(trash_file):
+        return None
+
+    rel_path = row["rel_path"]
+    candidate = resolve_storage_path(base_dir, rel_path)
+    if candidate is None:
+        return None
+
+    if os.path.exists(candidate) or active_file_exists(row["zone"], rel_path):
+        filename = os.path.basename(rel_path)
+        prefix = rel_path.rsplit("/", 1)[0] if "/" in rel_path else ""
+        rel_path = unique_rel_path(base_dir, prefix, filename, row["zone"])
+        candidate = resolve_storage_path(base_dir, rel_path)
+        if candidate is None:
+            return None
+
+    try:
+        ensure_dir(os.path.dirname(candidate))
+        shutil.move(trash_file, candidate)
+        try:
+            os.chmod(candidate, 0o640)
+        except OSError:
+            pass
+        grant_nginx_access(candidate)
+    except Exception:
+        app.logger.exception("Failed to restore file from trash")
+        return None
+
+    db = get_db()
+    db.execute(
+        "UPDATE files SET deleted_at=NULL, trash_path=NULL, rel_path=? WHERE id=?",
+        (rel_path, row["id"]),
+    )
+    db.commit()
+    return rel_path
+
+
+def purge_file_record(row):
+    trash_file = trash_physical_path(row)
+    if trash_file and os.path.isfile(trash_file):
+        try:
+            os.remove(trash_file)
+        except OSError:
+            app.logger.exception("Failed to remove trash file")
+            return False
+    db = get_db()
+    db.execute("DELETE FROM files WHERE id=?", (row["id"],))
     db.commit()
     return True
 
@@ -715,7 +1023,8 @@ def security_headers(response):
 
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self'; style-src 'self'; "
-        "img-src 'self' data:; object-src 'none'; "
+        "img-src 'self' data:; media-src 'self'; object-src 'none'; "
+        "worker-src 'self'; manifest-src 'self'; "
         "base-uri 'none'; frame-ancestors 'none'; connect-src 'self'"
     )
     return response
@@ -833,10 +1142,50 @@ def xaccel_public_protected_response(rel_path, filename):
 # =====================================================================
 # ГЛАВНАЯ
 # =====================================================================
+def get_admin_stats():
+    db = get_db()
+    totals = db.execute(
+        "SELECT COUNT(*) AS files_count, "
+        "COALESCE(SUM(size), 0) AS total_size, "
+        "COALESCE(SUM(download_count), 0) AS downloads "
+        "FROM files WHERE deleted_at IS NULL"
+    ).fetchone()
+    trash_count = db.execute(
+        "SELECT COUNT(*) FROM files WHERE deleted_at IS NOT NULL"
+    ).fetchone()[0]
+    uploads_24h = db.execute(
+        "SELECT COUNT(*) FROM files WHERE deleted_at IS NULL "
+        "AND created_at >= datetime('now', '-1 day')"
+    ).fetchone()[0]
+    events_24h = db.execute(
+        "SELECT COUNT(*) FROM audit_log "
+        "WHERE created_at >= datetime('now', '-1 day')"
+    ).fetchone()[0]
+    users_count = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    disk = shutil.disk_usage(STORAGE_DIR)
+    recent_activity = db.execute(
+        "SELECT * FROM audit_log ORDER BY id DESC LIMIT 8"
+    ).fetchall()
+    stats = {
+        "users": users_count,
+        "files": totals["files_count"],
+        "size": totals["total_size"],
+        "downloads": totals["downloads"],
+        "trash": trash_count,
+        "uploads_24h": uploads_24h,
+        "events_24h": events_24h,
+        "disk_total": disk.total,
+        "disk_free": disk.free,
+    }
+    return stats, recent_activity
+
+
 @app.route("/")
 def index():
     if "user" in session:
+        username = session["user"]
         if session.get("is_admin"):
+            sync_public_files()
             db = get_db()
             users_rows = db.execute(
                 "SELECT id, username, is_admin FROM users ORDER BY username"
@@ -856,7 +1205,16 @@ def index():
                 for r in users_rows
             ]
             return render_template("admin.html", users=users)
-        return render_template("user.html", user=session["user"])
+
+        usage = get_user_usage(username)
+        percent = min(100, int((usage / USER_QUOTA) * 100)) if USER_QUOTA else 100
+        recent_files = list_files(
+            private_username=secure_filename(username), sort="date_desc"
+        )[:5]
+        return render_template(
+            "user.html", user=username, usage=usage,
+            quota_percent=percent, recent_files=recent_files,
+        )
     return render_template("login.html")
 
 
@@ -948,14 +1306,26 @@ def change_password():
 @login_required
 def cloud():
     q = request.args.get("q", "").strip()
+    kind = request.args.get("kind", "all")
+    if kind not in FILE_KIND_GROUPS:
+        kind = "all"
+    sort = request.args.get("sort", "date_desc")
+    if sort not in FILE_SORT_SQL:
+        sort = "date_desc"
+
+    sync_public_files()
+
     username = session["user"]
     is_admin = session.get("is_admin", False)
 
-    public_files = list_files(zone="public", q=q)
+    public_files = list_files(zone="public", q=q, kind=kind, sort=sort)
     if is_admin:
-        private_files = list_files(zone="private", q=q)
+        private_files = list_files(zone="private", q=q, kind=kind, sort=sort)
     else:
-        private_files = list_files(private_username=secure_filename(username), q=q)
+        private_files = list_files(
+            private_username=secure_filename(username),
+            q=q, kind=kind, sort=sort,
+        )
 
     users = []
     if is_admin:
@@ -973,6 +1343,8 @@ def cloud():
         public_files=public_files,
         private_files=private_files,
         users=users, q=q, usage=usage, quota_percent=quota_percent,
+        kind=kind, sort=sort,
+        kind_labels=FILE_KIND_LABELS, sort_options=FILE_SORT_OPTIONS,
     )
 
 
@@ -1228,6 +1600,145 @@ def cloud_delete(file_id):
 
 
 # =====================================================================
+# ОБЛАКО: КОРЗИНА
+# =====================================================================
+@app.route("/cloud/trash")
+@login_required
+def cloud_trash():
+    files = list_trash_files(include_all=bool(session.get("is_admin")))
+    return render_template("trash.html", files=files)
+
+
+@app.route("/cloud/trash/restore/<int:file_id>", methods=["POST"])
+@login_required
+def restore_file(file_id):
+    row = get_db().execute(
+        "SELECT * FROM files WHERE id=? AND deleted_at IS NOT NULL", (file_id,)
+    ).fetchone()
+    if not row or not can_manage_file(row):
+        flash("❌ Файл не найден")
+        return redirect(url_for("cloud_trash"))
+    rel_path = restore_file_record(row)
+    if not rel_path:
+        flash("❌ Не удалось восстановить файл")
+        return redirect(url_for("cloud_trash"))
+    audit("restore", rel_path)
+    flash(f"♻️ Файл восстановлен: {os.path.basename(rel_path)}")
+    return redirect(url_for("cloud_trash"))
+
+
+@app.route("/cloud/trash/purge/<int:file_id>", methods=["POST"])
+@login_required
+def purge_file(file_id):
+    row = get_db().execute(
+        "SELECT * FROM files WHERE id=? AND deleted_at IS NOT NULL", (file_id,)
+    ).fetchone()
+    if not row or not can_manage_file(row):
+        flash("❌ Файл не найден")
+        return redirect(url_for("cloud_trash"))
+    if not purge_file_record(row):
+        flash("❌ Не удалось удалить файл")
+        return redirect(url_for("cloud_trash"))
+    audit("purge", row["rel_path"])
+    flash("🔥 Файл удалён безвозвратно")
+    return redirect(url_for("cloud_trash"))
+
+
+@app.route("/cloud/trash/empty", methods=["POST"])
+@login_required
+def empty_trash():
+    rows = get_db().execute(
+        "SELECT * FROM files WHERE deleted_at IS NOT NULL" +
+        ("" if session.get("is_admin") else " AND owner = ?"),
+        () if session.get("is_admin") else (session.get("user"),),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        if purge_file_record(row):
+            count += 1
+    audit("trash_emptied", f"count={count}")
+    flash(f"🔥 Корзина очищена: {count} файл(ов)")
+    return redirect(url_for("cloud_trash"))
+
+
+# =====================================================================
+# ОБЛАКО: ПРЕДПРОСМОТР И СКАЧИВАНИЕ
+# =====================================================================
+def preview_path_for(row):
+    base_dir = PRIVATE_DIR if row["zone"] == "private" else PUBLIC_DIR
+    path = safe_storage_path(base_dir, row["rel_path"])
+    if not os.path.isfile(path):
+        abort(404)
+    return path
+
+
+@app.route("/cloud/preview/<int:file_id>")
+@login_required
+def file_preview(file_id):
+    row = get_active_file_by_id(file_id)
+    if not row or not can_access_file_row(row):
+        abort(404)
+    kind = preview_kind(row["rel_path"])
+    if not kind:
+        flash("❌ Предпросмотр для этого файла недоступен")
+        return redirect(url_for("cloud"))
+    return render_template(
+        "preview.html",
+        file=file_to_dict(row),
+        kind=kind,
+        raw_url=url_for("file_raw", file_id=file_id),
+        download_url=url_for("file_download", file_id=file_id),
+    )
+
+
+@app.route("/cloud/raw/<int:file_id>")
+@login_required
+def file_raw(file_id):
+    row = get_active_file_by_id(file_id)
+    if not row or not can_access_file_row(row):
+        abort(404)
+    kind = preview_kind(row["rel_path"])
+    if not kind:
+        abort(404)
+    path = preview_path_for(row)
+    name = os.path.basename(path)
+
+    if kind == "text":
+        mimetype = "text/plain; charset=utf-8"
+    elif kind == "pdf":
+        mimetype = "application/pdf"
+    else:
+        mimetype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+    response = send_file(
+        path, mimetype=mimetype, download_name=name,
+        conditional=True, as_attachment=False,
+    )
+    response.headers["Content-Disposition"] = (
+        f"inline; filename*=UTF-8''{quote(name)}"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = (
+        "private, max-age=300" if row["zone"] == "public" else "no-store"
+    )
+    return response
+
+
+@app.route("/cloud/download/<int:file_id>")
+@login_required
+def file_download(file_id):
+    row = get_active_file_by_id(file_id)
+    if not row or not can_access_file_row(row):
+        abort(404)
+    increment_download(row["id"])
+    name = os.path.basename(row["rel_path"])
+    if row["zone"] == "private" and USE_X_ACCEL:
+        return xaccel_private_response(row["rel_path"], name)
+    path = preview_path_for(row)
+    return send_secure_file(path, attachment=True)
+
+
+# =====================================================================
 # ПРИВАТНЫЕ ФАЙЛЫ
 # =====================================================================
 @app.route("/private/<username>/<path:filename>")
@@ -1289,6 +1800,85 @@ def share_download(token):
             return xaccel_private_response(row["rel_path"], filename_base)
         return xaccel_public_protected_response(row["rel_path"], filename_base)
     return send_secure_file(path, attachment=True)
+
+
+# =====================================================================
+# АДМИН: СТАТИСТИКА И СИНХРОНИЗАЦИЯ
+# =====================================================================
+@app.route("/admin/stats")
+@admin_required
+def admin_stats():
+    sync_public_files()
+    stats, recent_activity = get_admin_stats()
+    return render_template(
+        "admin_stats.html", stats=stats,
+        recent_activity=recent_activity,
+        action_labels=AUDIT_ACTION_LABELS,
+    )
+
+
+@app.route("/admin/sync-public", methods=["POST"])
+@admin_required
+def admin_sync_public():
+    added = sync_public_files(force=True)
+    audit("public_synced", f"added={added}")
+    flash(f"✅ Синхронизация завершена. Добавлено файлов: {added}")
+    return redirect(url_for("admin_stats"))
+
+
+# =====================================================================
+# АДМИН: ЖУРНАЛ АКТИВНОСТИ
+# =====================================================================
+@app.route("/admin/activity")
+@admin_required
+def admin_activity():
+    action = request.args.get("action", "").strip()
+    username = request.args.get("user", "").strip()
+    page = request.args.get("page", 1, type=int) or 1
+    if page < 1:
+        page = 1
+    per_page = 50
+
+    where = []
+    params = []
+    if action:
+        where.append("action = ?")
+        params.append(action)
+    if username:
+        where.append("username = ?")
+        params.append(username)
+    clause = " AND ".join(where) if where else "1=1"
+
+    db = get_db()
+    total = db.execute(
+        f"SELECT COUNT(*) FROM audit_log WHERE {clause}", params
+    ).fetchone()[0]
+    pages = max(1, (total + per_page - 1) // per_page)
+    if page > pages:
+        page = pages
+    rows = db.execute(
+        f"SELECT * FROM audit_log WHERE {clause} "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        params + [per_page, (page - 1) * per_page],
+    ).fetchall()
+    actions = [
+        r["action"] for r in db.execute(
+            "SELECT DISTINCT action FROM audit_log ORDER BY action"
+        ).fetchall()
+    ]
+    usernames = [
+        r["username"] for r in db.execute(
+            "SELECT DISTINCT username FROM audit_log "
+            "WHERE username IS NOT NULL ORDER BY username"
+        ).fetchall()
+    ]
+
+    return render_template(
+        "activity.html", rows=rows, action=action, username=username,
+        actions=actions, usernames=usernames, page=page, pages=pages,
+        total=total, per_page=per_page,
+        action_labels=AUDIT_ACTION_LABELS,
+    )
 
 
 # =====================================================================
@@ -1374,7 +1964,7 @@ def ssh_page():
         certs=certs,
         now=dbnow(),
         principal=SSH_PRINCIPAL,
-        host=SSH_HOST_HINT,
+        host_hint=SSH_HOST_HINT,
         port=SSH_PORT,
         min_ttl=SSH_MIN_TTL,
         max_ttl=SSH_MAX_TTL,
@@ -1435,7 +2025,7 @@ def ssh_generate():
         "ssh_result.html",
         priv=priv, cert=cert, ttl=ttl, token=token,
         cert_id=cur.lastrowid, principal=SSH_PRINCIPAL,
-        host=SSH_HOST_HINT, port=SSH_PORT, expires=expires,
+        host_hint=SSH_HOST_HINT, port=SSH_PORT, expires=expires,
     )
 
 
@@ -1479,6 +2069,265 @@ def ssh_revoke(cert_id):
 
 
 # =====================================================================
+# СИСТЕМА: СТАТУС, ЭКРАН, ПИТАНИЕ, ДИСК, ТЕРМОКОНТРОЛЬ
+# =====================================================================
+SYSTEM_ACTIONS = {
+    "display_on": (DISPLAY_HELPER, ["on"]),
+    "display_off": (DISPLAY_HELPER, ["off"]),
+    "power_eco": (POWER_HELPER, ["eco"]),
+    "power_balanced": (POWER_HELPER, ["balanced"]),
+    "power_performance": (POWER_HELPER, ["performance"]),
+    "disk_tune": (DISK_HELPER, []),
+}
+
+
+def _read_text(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return default
+
+
+def _read_int(path, default=None):
+    value = _read_text(path)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _json_response(payload, status=200):
+    response = Response(
+        json.dumps(payload, ensure_ascii=False),
+        status=status,
+        mimetype="application/json",
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _cpu_model():
+    for line in (_read_text("/proc/cpuinfo", "") or "").splitlines():
+        if line.lower().startswith("model name"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+
+def _cpu_temp():
+    try:
+        entries = os.listdir("/sys/class/hwmon")
+    except OSError:
+        entries = []
+    for entry in entries:
+        base = os.path.join("/sys/class/hwmon", entry)
+        if _read_text(os.path.join(base, "name")) != "coretemp":
+            continue
+        value = _read_int(os.path.join(base, "temp1_input"))
+        if value is not None:
+            return round(value / 1000.0, 1)
+    try:
+        zones = os.listdir("/sys/class/thermal")
+    except OSError:
+        zones = []
+    for zone in zones:
+        if not zone.startswith("thermal_zone"):
+            continue
+        base = os.path.join("/sys/class/thermal", zone)
+        if _read_text(os.path.join(base, "type")) not in ("x86_pkg_temp", "cpu-thermal"):
+            continue
+        value = _read_int(os.path.join(base, "temp"))
+        if value is not None:
+            return round(value / 1000.0, 1)
+    return None
+
+
+def _backlight_state():
+    try:
+        names = sorted(os.listdir("/sys/class/backlight"))
+    except OSError:
+        names = []
+    devices = []
+    for name in names:
+        base = os.path.join("/sys/class/backlight", name)
+        cur = _read_int(os.path.join(base, "brightness"))
+        mx = _read_int(os.path.join(base, "max_brightness"))
+        if cur is None or not mx:
+            continue
+        devices.append({
+            "name": name,
+            "brightness": cur,
+            "max": mx,
+            "percent": max(0, min(100, round(cur * 100 / mx))),
+        })
+    return devices
+
+
+def _service_active(unit):
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", unit],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return (result.stdout or "").strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _freq_mhz(path):
+    value = _read_int(path)
+    return round(value / 1000.0) if value else None
+
+
+def get_system_status():
+    saved = _read_json(SYSTEM_STATUS_FILE)
+    cpu = dict(saved.get("cpu") or {})
+    disk = dict(saved.get("disk") or {})
+    display = dict(saved.get("display") or {})
+
+    cpu["model"] = cpu.get("model") or _cpu_model()
+    cpu["temp"] = _cpu_temp()
+    try:
+        cpu["load1"] = round(os.getloadavg()[0], 2)
+    except OSError:
+        cpu["load1"] = None
+    cpu["governor"] = _read_text(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+    )
+    cpu["epp"] = _read_text(
+        "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+    )
+    cpu["freq_mhz"] = _freq_mhz(
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
+    )
+    cpu["max_mhz"] = _freq_mhz(
+        "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"
+    )
+    cpu["no_turbo"] = _read_int(
+        "/sys/devices/system/cpu/intel_pstate/no_turbo"
+    )
+    cpu["profile"] = cpu.get("profile") or _read_text(
+        "/etc/goosko/power_profile", "unknown"
+    )
+    cpu["thermal"] = cpu.get("thermal") or "unknown"
+
+    display["lightdm"] = _service_active("lightdm")
+    display["backlight"] = _backlight_state()
+
+    block = os.path.basename(disk.get("dev") or "/dev/sda")
+    disk["dev"] = disk.get("dev") or "/dev/sda"
+    disk["model"] = disk.get("model") or _read_text(
+        f"/sys/block/{block}/device/model"
+    )
+    disk["rotational"] = (
+        _read_text(f"/sys/block/{block}/queue/rotational") == "1"
+    )
+    scheduler = _read_text(f"/sys/block/{block}/queue/scheduler", "") or ""
+    match = re.search(r"\[([^\]]+)\]", scheduler)
+    disk["scheduler"] = (
+        match.group(1) if match
+        else (scheduler.split()[-1] if scheduler else None)
+    )
+
+    updated = saved.get("updated")
+    try:
+        stale = not updated or (time.time() - float(updated) > 180)
+    except (TypeError, ValueError):
+        stale = True
+
+    return {
+        "cpu": cpu,
+        "disk": disk,
+        "display": display,
+        "config": saved.get("config") or {},
+        "updated": updated,
+        "stale": stale,
+        "server_time": int(time.time()),
+        "helpers": {
+            "display": os.path.exists(DISPLAY_HELPER),
+            "power": os.path.exists(POWER_HELPER),
+            "disk": os.path.exists(DISK_HELPER),
+        },
+    }
+
+
+def _run_system_helper(argv):
+    if not os.path.exists(argv[0]):
+        return False, f"Не установлен помощник {argv[0]}. Запустите system/install.sh"
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", *argv],
+            capture_output=True, text=True,
+            timeout=HELPER_TIMEOUT, check=False,
+        )
+    except FileNotFoundError:
+        return False, "sudo не найден"
+    except subprocess.TimeoutExpired:
+        return False, "Команда не завершилась за отведённое время"
+    output = (result.stdout or "").strip()
+    error = (result.stderr or "").strip()
+    if result.returncode == 0:
+        return True, output or "Готово"
+    return False, error or output or f"Код возврата {result.returncode}"
+
+
+@app.route("/system")
+@admin_required
+def system_page():
+    return render_template("system.html", status=get_system_status())
+
+
+@app.route("/system/status")
+@admin_required
+def system_status():
+    return _json_response(get_system_status())
+
+
+@app.route("/system/action", methods=["POST"])
+@admin_required
+def system_action():
+    payload = request.get_json(silent=True) or request.form
+    action = str(payload.get("action", "")).strip()
+
+    if action == "brightness":
+        try:
+            value = int(payload.get("value", 100))
+        except (TypeError, ValueError):
+            return _json_response(
+                {"ok": False, "message": "Некорректная яркость"}, 400
+            )
+        if not 0 <= value <= 100:
+            return _json_response(
+                {"ok": False, "message": "Яркость должна быть 0–100%"}, 400
+            )
+        argv = [DISPLAY_HELPER, "brightness", str(value)]
+    else:
+        item = SYSTEM_ACTIONS.get(action)
+        if not item:
+            return _json_response(
+                {"ok": False, "message": "Неизвестное действие"}, 400
+            )
+        argv = [item[0], *item[1]]
+
+    ok, message = _run_system_helper(argv)
+    audit("system_action", f"{action}: {message[:180]}")
+    return _json_response(
+        {"ok": ok, "message": message}, 200 if ok else 500
+    )
+
+
+# =====================================================================
 # СЛУЖЕБНЫЙ РОУТ (для auth_request в Nginx)
 # =====================================================================
 @app.route("/check")
@@ -1486,6 +2335,34 @@ def check():
     if "user" in session:
         return "", 200
     return "", 401
+
+
+# =====================================================================
+# PWA
+# =====================================================================
+@app.route("/manifest.webmanifest")
+def web_manifest():
+    response = send_from_directory(
+        app.static_folder, "manifest.webmanifest",
+        mimetype="application/manifest+json",
+    )
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
+@app.route("/sw.js")
+def service_worker():
+    response = send_from_directory(
+        app.static_folder, "sw.js", mimetype="application/javascript",
+    )
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.route("/offline")
+def offline_page():
+    return render_template("offline.html")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Ошибка: нужен root" >&2
+    exit 1
+fi
+
+ACTION="${1:-status}"
+
+backlight_set_percent() {
+    local percent="$1"
+    local bl cur max
+    for bl in /sys/class/backlight/*; do
+        [ -d "$bl" ] || continue
+        cur="$bl/brightness"
+        max="$bl/max_brightness"
+        [ -w "$cur" ] || continue
+        [ -r "$max" ] || continue
+        local maxv
+        maxv=$(cat "$max" 2>/dev/null || echo 0)
+        [ "$maxv" -gt 0 ] 2>/dev/null || continue
+        echo $(( maxv * percent / 100 )) > "$cur" 2>/dev/null || true
+    done
+}
+
+case "$ACTION" in
+    on)
+        systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null 2>&1 || true
+
+        if [ -f /sys/class/graphics/fb0/blank ]; then
+            echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null || true
+        fi
+
+        backlight_set_percent 100
+
+        if systemctl start lightdm.service; then
+            echo "Экран включён, LightDM запущен"
+        else
+            echo "Подсветка включена, но LightDM не запустился" >&2
+            exit 1
+        fi
+        ;;
+
+    off)
+        systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target >/dev/null 2>&1 || true
+        systemctl stop lightdm.service >/dev/null 2>&1 || true
+
+        if [ -f /sys/class/graphics/fb0/blank ]; then
+            echo 1 > /sys/class/graphics/fb0/blank 2>/dev/null || true
+        fi
+
+        backlight_set_percent 0
+        setterm --blank force --powerdown force 2>/dev/null || true
+        echo "Экран выключен, сервер работает в headless-режиме"
+        ;;
+
+    brightness)
+        PERCENT="${2:-}"
+        case "$PERCENT" in
+            ''|*[!0-9]*)
+                echo "Использование: $0 brightness 0..100" >&2
+                exit 2
+                ;;
+        esac
+        if [ "$PERCENT" -lt 0 ] || [ "$PERCENT" -gt 100 ]; then
+            echo "Яркость должна быть 0..100" >&2
+            exit 2
+        fi
+        backlight_set_percent "$PERCENT"
+        echo "Яркость: ${PERCENT}%"
+        ;;
+
+    status)
+        echo "lightdm=$(systemctl is-active lightdm.service 2>/dev/null || true)"
+        if [ -f /sys/class/graphics/fb0/blank ]; then
+            echo "fb_blank=$(cat /sys/class/graphics/fb0/blank 2>/dev/null || echo unknown)"
+        fi
+        for bl in /sys/class/backlight/*; do
+            [ -d "$bl" ] || continue
+            cur=$(cat "$bl/brightness" 2>/dev/null || echo '?')
+            max=$(cat "$bl/max_brightness" 2>/dev/null || echo '?')
+            echo "backlight=$(basename "$bl") ${cur}/${max}"
+        done
+        ;;
+
+    *)
+        echo "Использование: $0 {on|off|status|brightness 0..100}" >&2
+        exit 2
+        ;;
+esac

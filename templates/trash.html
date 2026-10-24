@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}Корзина | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>🗑️ Корзина</h1>
+        <p class="muted">
+            Удалённые файлы можно восстановить или стереть безвозвратно.
+            {% if session.get('is_admin') %}Администратор видит корзины всех пользователей.{% endif %}
+        </p>
+    </div>
+
+    {% if files %}
+        <form method="post" action="{{ url_for('empty_trash') }}"
+              data-confirm="Очистить корзину полностью? Файлы будут удалены безвозвратно.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn danger" type="submit">🔥 Очистить всё</button>
+        </form>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>📦 Файлы ({{ files|length }})</h2>
+
+    {% if files %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Файл</th>
+                        <th>Зона</th>
+                        {% if session.get('is_admin') %}
+                            <th>Владелец</th>
+                        {% endif %}
+                        <th>Размер</th>
+                        <th>Удалён</th>
+                        <th>Действия</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for f in files %}
+                    <tr>
+                        <td data-label="Файл">
+                            {{ '🌐' if f.zone == 'public' else '🔒' }}
+                            {{ f.name }}
+                        </td>
+                        <td data-label="Зона">
+                            <span class="badge">{{ 'Публичная' if f.zone == 'public' else 'Приватная' }}</span>
+                        </td>
+                        {% if session.get('is_admin') %}
+                            <td data-label="Владелец">{{ f.owner }}</td>
+                        {% endif %}
+                        <td data-label="Размер">{{ f.size|human_size }}</td>
+                        <td data-label="Удалён">{{ f.deleted_at }}</td>
+                        <td data-label="Действия" class="file-actions">
+                            <form method="post" action="{{ url_for('restore_file', file_id=f.id) }}">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn small" type="submit">♻️ Восстановить</button>
+                            </form>
+
+                            <form method="post" action="{{ url_for('purge_file', file_id=f.id) }}"
+                                  data-confirm="Удалить файл безвозвратно?">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn small danger" type="submit">🔥 Удалить</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <span>📭</span>
+            <p>Корзина пуста</p>
+        </div>
+    {% endif %}
+</div>
+
+<a class="btn" href="{{ url_for('cloud') }}">← Назад в облако</a>
+{% endblock %}
