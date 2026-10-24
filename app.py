@@ -13,6 +13,7 @@ from flask_limiter.util import get_remote_address
 
 import sqlite3
 import functools
+import threading
 import json
 import os
 import secrets
@@ -2246,7 +2247,25 @@ def _freq_mhz(path):
     return round(value / 1000.0) if value else None
 
 
+SYSTEM_STATUS_CACHE_TTL = 5.0  # секунд; /system/status опрашивается каждые 10с
+_status_cache_lock = threading.Lock()
+_status_cache: dict = {"t": 0.0, "data": None}
+
+
 def get_system_status():
+    now = time.time()
+    with _status_cache_lock:
+        if _status_cache["data"] is not None and now - _status_cache["t"] < SYSTEM_STATUS_CACHE_TTL:
+            return _status_cache["data"]
+
+    data = _build_system_status()
+    with _status_cache_lock:
+        _status_cache["t"] = time.time()
+        _status_cache["data"] = data
+    return data
+
+
+def _build_system_status():
     saved = _read_json(SYSTEM_STATUS_FILE)
     cpu = dict(saved.get("cpu") or {})
     disk = dict(saved.get("disk") or {})
@@ -2381,6 +2400,11 @@ def system_action():
 
     ok, message = _run_system_helper(argv)
     audit("system_action", f"{action}: {message[:180]}")
+    if ok:
+        # helpers меняют состояние (экран, профиль, funnel) — кеш не нужен
+        with _status_cache_lock:
+            _status_cache["t"] = 0.0
+            _status_cache["data"] = None
     return _json_response(
         {"ok": ok, "message": message}, 200 if ok else 500
     )

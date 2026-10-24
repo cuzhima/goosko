@@ -1,9 +1,8 @@
 const CACHE_NAME = "goosko-v3";
+// Разметку с ?v=... НЕ пре-кешим: их версии ставит шаблон и они снова конфликтуют с файлами.
+// Кеширование статики работает в fetch-обработчике (runtime cache).
 const PRECACHE = [
     "/offline",
-    "/static/app.css?v=20261024c",
-    "/static/app.js?v=20261024c",
-    "/static/theme.js?v=20261024c",
     "/static/manifest.webmanifest",
     "/static/icons/icon-192.png",
     "/static/icons/icon-512.png",
