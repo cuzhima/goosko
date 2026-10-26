@@ -23,7 +23,7 @@ echo "Пользователь: $TARGET_USER, диск: $DISK"
 
 install -d -m 0755 "$BIN" "$CONF_DIR" /run/goosko /etc/sysctl.d /etc/sudoers.d
 
-for helper in goosko-display goosko-power goosko-disk-tune goosko-thermal goosko-funnel; do
+for helper in goosko-display goosko-power goosko-disk-tune goosko-thermal goosko-funnel goosko-powerctl goosko-webcam; do
     install -m 0755 "$SRC/$helper" "$BIN/$helper"
     echo "  helper: $BIN/$helper"
 done
@@ -70,7 +70,7 @@ if command -v visudo >/dev/null 2>&1; then
         exit 1
     fi
 fi
-echo "  sudoers: разрешены 6 помощников для $TARGET_USER"
+echo "  sudoers: разрешены 8 помощников для $TARGET_USER"
 
 systemctl daemon-reload
 for unit in goosko-power.service goosko-disk-tune.service goosko-thermal.service; do

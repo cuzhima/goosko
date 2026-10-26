@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# goosko-webcam — снимок с камеры моноблока (USB "Y Media Corp").
+# Кладёт JPEG в tmpfs (/run/goosko) — файл не переживает перезагрузку.
+# Вызывается только через sudo -n из goosko-web (см. /etc/sudoers.d/goosko).
+set -uo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Ошибка: нужен root" >&2
+    exit 1
+fi
+
+OUT="${1:-/run/goosko/webcam.jpg}"
+TMP="${OUT}.part"
+mkdir -p "$(dirname "$OUT")"
+
+FSWEBCAM=/usr/bin/fswebcam
+[ -x "$FSWEBCAM" ] || { echo "fswebcam не найден" >&2; exit 3; }
+
+# Пробуем оба video-нода и несколько разрешений: у камеры бывают медленные
+# автоэкспозиция и прогрев, поэтому -S пропускает первые кадры.
+rc=1
+for dev in /dev/video0 /dev/video1; do
+    [ -e "$dev" ] || continue
+    for res in 1280x720 640x480; do
+        if "$FSWEBCAM" -d "$dev" -r "$res" --jpeg 85 -S 5 --no-banner \
+            --quiet "$TMP" >/dev/null 2>&1 && [ -s "$TMP" ]; then
+            rc=0
+            break 2
+        fi
+        rc=1
+    done
+    [ "$rc" -eq 0 ] && break
+done
+
+if [ "$rc" -ne 0 ]; then
+    rm -f "$TMP"
+    echo "Не удалось снять кадр: камера не ответила" >&2
+    exit 4
+fi
+
+mv -f "$TMP" "$OUT"
+chmod 644 "$OUT"
+echo "Снимок сохранён: $OUT ($(stat -c%s "$OUT") байт)"

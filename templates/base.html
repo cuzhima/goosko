@@ -12,7 +12,7 @@
     <link rel="manifest" href="{{ url_for('web_manifest') }}">
     <link rel="icon" href="{{ url_for('static', filename='icons/icon-192.png', v='20261024c') }}" type="image/png">
     <link rel="apple-touch-icon" href="{{ url_for('static', filename='icons/apple-touch-icon.png', v='20261024c') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20261024e') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css', v='20261026a') }}">
     <script src="{{ url_for('static', filename='theme.js', v='20261024c') }}"></script>
 </head>
 <body>
@@ -20,7 +20,7 @@
 
     <header class="topbar">
         <div class="container topbar-inner">
-            <a class="brand" href="/">ГОО СКО</a>
+            <a class="brand" href="/"><img class="brand-logo" src="{{ url_for('static', filename='logo.svg') }}" alt="ГОО СКО" width="28" height="28">ГОО СКО</a>
 
             <button class="menu-toggle" type="button" data-menu-toggle
                     aria-controls="main-nav" aria-expanded="false" aria-label="Открыть меню">

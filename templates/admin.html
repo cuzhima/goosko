@@ -12,6 +12,7 @@
     <div class="file-actions">
         <a class="btn" href="{{ url_for('admin_stats') }}">📊 Статистика</a>
         <a class="btn" href="{{ url_for('admin_activity') }}">📜 Журнал</a>
+        <a class="btn" href="{{ url_for('admin_sessions') }}">🟢 Сессии</a>
         <a class="btn" href="{{ url_for('cloud_trash') }}">🗑️ Корзина</a>
         <a class="btn primary" href="{{ url_for('cloud') }}">☁️ Облако</a>
     </div>
@@ -64,6 +65,38 @@
     </div>
 
     <div class="card">
+        <h2>📷 Веб-камера</h2>
+        <p class="muted">Снимок с камеры моноблока сохраняется во временный файл и не хранится в облаке.</p>
+        <div class="file-actions">
+            <button class="btn primary" type="button" id="webcam-shot-btn">Сделать снимок</button>
+        </div>
+        <div id="webcam-shot-box" class="webcam-shot" hidden>
+            <img id="webcam-shot-img" alt="Снимок с камеры">
+        </div>
+    </div>
+</div>
+
+<div class="grid two">
+    <div class="card">
+        <h2>⏻ Питание</h2>
+        <p class="muted">Действия выполняются сразу после подтверждения. Сайт и Termix/Cockpit станут недоступны.</p>
+        <div class="file-actions">
+            <form method="post" action="{{ url_for('admin_power') }}"
+                  data-confirm="Точно перезагрузить компьютер? Сайт будет недоступен пару минут.">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="action" value="reboot">
+                <button class="btn" type="submit">🔄 Перезагрузить</button>
+            </form>
+            <form method="post" action="{{ url_for('admin_power') }}"
+                  data-confirm="ВЫКЛЮЧИТЬ компьютер? Сайт будет недоступен, пока его не включат вручную!">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="action" value="shutdown">
+                <button class="btn danger" type="submit">⏻ Выключить</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card">
         <h2>🔑 Безопасность</h2>
         <p>Смена пароля, квота и настройки аккаунта находятся в разделе «Аккаунт».</p>
         <a class="btn" href="/account">Перейти к аккаунту</a>
@@ -113,4 +146,8 @@
         </table>
     </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='admin.js', v='20261026a') }}" defer></script>
 {% endblock %}

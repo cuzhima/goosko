@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Активные сессии | ГОО СКО{% endblock %}
+
+{% block content %}
+<div class="page-head">
+    <div>
+        <h1>🟢 Активные сессии</h1>
+        <p class="muted">
+            Активны последние {{ window_min }} минут: {{ rows|length }}
+        </p>
+    </div>
+
+    <a class="btn" href="{{ url_for('index') }}">← В панель</a>
+</div>
+
+<div class="card">
+    {% if rows %}
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Пользователь</th>
+                        <th>IP</th>
+                        <th>Браузер</th>
+                        <th>Начало</th>
+                        <th>Активность</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for row in rows %}
+                    <tr {% if row['sid'] == current_sid %}class="row-current"{% endif %}>
+                        <td data-label="Пользователь">
+                            🧑 {{ row['username'] }}
+                            {% if row['sid'] == current_sid %}
+                                <span class="badge ok">это вы</span>
+                            {% endif %}
+                        </td>
+                        <td data-label="IP"><code>{{ row['ip'] or '—' }}</code></td>
+                        <td data-label="Браузер" class="event-details">{{ row['user_agent'] or '—' }}</td>
+                        <td data-label="Начало">{{ row['created_at'] }}</td>
+                        <td data-label="Активность">{{ row['last_seen'] }}</td>
+                        <td data-label="" class="file-actions">
+                            {% if row['sid'] != current_sid %}
+                                <form method="post"
+                                      action="{{ url_for('admin_session_kick', sid=row['sid']) }}"
+                                      data-confirm="Завершить сессию пользователя {{ row['username'] }}?">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <button class="btn small danger" type="submit">Завершить</button>
+                                </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <div class="empty-state">
+            <span>😴</span>
+            <p>Активных сессий нет.</p>
+        </div>
+    {% endif %}
+</div>
+{% endblock %}

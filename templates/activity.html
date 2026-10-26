@@ -9,7 +9,14 @@
         <p class="muted">Всего событий: {{ total }}</p>
     </div>
 
-    <a class="btn" href="{{ url_for('index') }}">← В панель</a>
+    <div class="file-actions">
+        <a class="btn" href="{{ url_for('index') }}">← В панель</a>
+        <form method="post" action="{{ url_for('admin_activity_clear') }}"
+              data-confirm="Очистить журнал активности полностью? Действие необратимо.">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn danger" type="submit">🧹 Очистить журнал</button>
+        </form>
+    </div>
 </div>
 
 <div class="card">

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# goosko-powerctl — выключение/перезагрузка ПК по кнопке из админки goosko.online.
+# Вызывается только через sudo -n из goosko-web (см. /etc/sudoers.d/goosko).
+set -euo pipefail
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Ошибка: нужен root" >&2
+    exit 1
+fi
+
+ACTION="${1:-}"
+
+case "$ACTION" in
+    reboot)
+        # Отделяем процесс: systemd убьёт gunicorn раньше, чем ответит redirect.
+        (sleep 2 && systemctl reboot) &
+        disown
+        echo "reboot запланирован"
+        ;;
+    shutdown|poweroff)
+        (sleep 2 && systemctl poweroff) &
+        disown
+        echo "poweroff запланирован"
+        ;;
+    *)
+        echo "Использование: $0 {reboot|shutdown}" >&2
+        exit 2
+        ;;
+esac

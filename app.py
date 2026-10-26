@@ -105,6 +105,9 @@ DISPLAY_HELPER = os.environ.get("DISPLAY_HELPER", "/usr/local/sbin/goosko-displa
 POWER_HELPER = os.environ.get("POWER_HELPER", "/usr/local/sbin/goosko-power")
 DISK_HELPER = os.environ.get("DISK_HELPER", "/usr/local/sbin/goosko-disk-tune")
 FUNNEL_HELPER = os.environ.get("FUNNEL_HELPER", "/usr/local/sbin/goosko-funnel")
+POWERCTL_HELPER = os.environ.get("POWERCTL_HELPER", "/usr/local/sbin/goosko-powerctl")
+WEBCAM_HELPER = os.environ.get("WEBCAM_HELPER", "/usr/local/sbin/goosko-webcam")
+WEBCAM_SNAPSHOT = os.environ.get("WEBCAM_SNAPSHOT", "/run/goosko/webcam.jpg")
 FUNNEL_STATE_FILE = os.environ.get("FUNNEL_STATE_FILE", "/run/goosko/funnel")
 HELPER_TIMEOUT = int(os.environ.get("HELPER_TIMEOUT", "30"))
 
@@ -142,7 +145,9 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
     MAX_CONTENT_LENGTH=MAX_FILE_SIZE,
-    WTF_CSRF_TIME_LIMIT=3600,
+    # None: токен CSRF живёт вместе с сессией. Лимит 3600 протухал у форм,
+    # открытых дольше часа («Создать пользователя» в админке) — POST тихо падал.
+    WTF_CSRF_TIME_LIMIT=None,
     WTF_CSRF_SSL_STRICT=False,
     PREFERRED_URL_SCHEME="https",
 )
@@ -361,6 +366,15 @@ def init_db():
             revoked_at TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS sessions (
+            sid TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            ip TEXT,
+            user_agent TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active
             ON files(zone, rel_path) WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner);
@@ -412,6 +426,52 @@ def close_db(exception=None):
 
 
 init_db()
+
+
+# =====================================================================
+# АКТИВНЫЕ СЕССИИ
+# =====================================================================
+SESSION_ACTIVE_WINDOW_MIN = 30  # сколько сессия считается активной
+
+
+@app.before_request
+def track_active_session():
+    """Обновляет last_seen сессии; выкинутая админом — разлогинивает."""
+    if "user" not in session:
+        return
+    sid = session.get("sid")
+    if not sid:
+        return  # сессии, открытые до появления трекинга
+    try:
+        cur = get_db().execute(
+            "UPDATE sessions SET last_seen=?, ip=?, user_agent=? WHERE sid=?",
+            (
+                dbnow(), request.remote_addr,
+                (request.headers.get("User-Agent") or "")[:200], sid,
+            ),
+        )
+        get_db().commit()
+    except Exception:
+        app.logger.exception("Session tracking failed")
+        return
+    if cur.rowcount == 0:
+        session.clear()
+        flash("Сессия завершена администратором.")
+
+
+def register_session(username):
+    """Создаёт запись сессии (при входе) и возвращает sid для cookie."""
+    sid = secrets.token_hex(16)
+    db = get_db()
+    db.execute(
+        "INSERT INTO sessions (sid, username, ip, user_agent) VALUES (?,?,?,?)",
+        (
+            sid, username, request.remote_addr,
+            (request.headers.get("User-Agent") or "")[:200],
+        ),
+    )
+    db.commit()
+    return sid
 
 
 # =====================================================================
@@ -497,6 +557,11 @@ AUDIT_ACTION_LABELS = {
     "ssh_cert_revoked": "Отозван SSH-сертификат",
     "public_synced": "Синхронизация public",
     "system_action": "Системная команда",
+    "log_cleared": "Журнал очищен",
+    "reboot": "Перезагрузка",
+    "shutdown": "Выключение",
+    "webcam_shot": "Снимок с камеры",
+    "session_kicked": "Завершена сессия",
 }
 
 
@@ -1289,6 +1354,7 @@ def login():
         session["user"] = row["username"]
         session["is_admin"] = bool(row["is_admin"])
         session.permanent = True
+        session["sid"] = register_session(row["username"])
         audit("login_success", username)
         return redirect("/")
     audit("login_failed", username)
@@ -1301,6 +1367,13 @@ def logout():
     username = session.get("user")
     if username:
         audit("logout", username)
+    sid = session.get("sid")
+    if sid:
+        try:
+            get_db().execute("DELETE FROM sessions WHERE sid=?", (sid,))
+            get_db().commit()
+        except Exception:
+            app.logger.exception("Session cleanup failed")
     session.clear()
     return redirect("/")
 
@@ -1949,6 +2022,105 @@ def admin_activity():
         total=total, per_page=per_page,
         action_labels=AUDIT_ACTION_LABELS,
     )
+
+
+# =====================================================================
+# АДМИН: АКТИВНЫЕ СЕССИИ
+# =====================================================================
+@app.route("/admin/sessions")
+@admin_required
+def admin_sessions():
+    rows = get_db().execute(
+        "SELECT * FROM sessions WHERE last_seen >= datetime('now', ?) "
+        "ORDER BY last_seen DESC",
+        (f"-{SESSION_ACTIVE_WINDOW_MIN} minutes",),
+    ).fetchall()
+    return render_template(
+        "sessions.html", rows=rows,
+        current_sid=session.get("sid"),
+        window_min=SESSION_ACTIVE_WINDOW_MIN,
+    )
+
+
+@app.route("/admin/sessions/kick/<sid>", methods=["POST"])
+@admin_required
+def admin_session_kick(sid):
+    db = get_db()
+    row = db.execute(
+        "SELECT username FROM sessions WHERE sid=?", (sid,)
+    ).fetchone()
+    if not row:
+        flash("❌ Сессия не найдена (уже завершена)")
+        return redirect(url_for("admin_sessions"))
+    if sid == session.get("sid"):
+        flash("❌ Это ваша текущая сессия — используйте «Выйти»")
+        return redirect(url_for("admin_sessions"))
+
+    db.execute("DELETE FROM sessions WHERE sid=?", (sid,))
+    db.commit()
+    audit("session_kicked", row["username"])
+    flash(f"🚪 Сессия пользователя {row['username']} завершена")
+    return redirect(url_for("admin_sessions"))
+
+
+# =====================================================================
+# АДМИН: ПИТАНИЕ, ВЕБ-КАМЕРА, ОЧИСТКА ЖУРНАЛА
+# =====================================================================
+@app.route("/admin/power", methods=["POST"])
+@admin_required
+def admin_power():
+    action = request.form.get("action", "")
+    if action == "reboot":
+        ok, message = _run_system_helper([POWERCTL_HELPER, "reboot"])
+        audit("reboot", message[:180])
+        if ok:
+            flash("🔄 Перезагрузка запущена. Сайт будет недоступен пару минут.")
+        else:
+            flash(f"⚠️ Не удалось: {message}")
+    elif action == "shutdown":
+        ok, message = _run_system_helper([POWERCTL_HELPER, "shutdown"])
+        audit("shutdown", message[:180])
+        if ok:
+            flash("⏻ Выключение запущено. Сайт будет недоступен до включения ПК.")
+        else:
+            flash(f"⚠️ Не удалось: {message}")
+    else:
+        flash("❌ Неизвестное действие")
+    return redirect(url_for("index"))
+
+
+@app.route("/admin/webcam", methods=["POST"])
+@admin_required
+def admin_webcam_capture():
+    ok, message = _run_system_helper([WEBCAM_HELPER])
+    audit("webcam_shot", message[:180] if ok else "снимок не удался")
+    return _json_response(
+        {
+            "ok": ok, "message": message,
+            "url": url_for("admin_webcam_image", ts=int(time.time())) if ok else None,
+        },
+        200 if ok else 500,
+    )
+
+
+@app.route("/admin/webcam/image")
+@admin_required
+def admin_webcam_image():
+    if not os.path.exists(WEBCAM_SNAPSHOT):
+        abort(404)
+    response = send_file(WEBCAM_SNAPSHOT, mimetype="image/jpeg", max_age=0)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/admin/activity/clear", methods=["POST"])
+@admin_required
+def admin_activity_clear():
+    get_db().execute("DELETE FROM audit_log")
+    get_db().commit()
+    audit("log_cleared", "Журнал очищен администратором")
+    flash("🧹 Журнал активности очищен")
+    return redirect(url_for("admin_activity"))
 
 
 # =====================================================================

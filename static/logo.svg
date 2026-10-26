@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="600" height="600" viewBox="0 0 600 600" role="img" aria-labelledby="ttl">
+  <title id="ttl">Сочинское краеведческое общество — география и история Сочи</title>
+
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#fce9c1"/>
+      <stop offset=".38" stop-color="#d5e9ef"/>
+      <stop offset="1"   stop-color="#9dc8dc"/>
+    </linearGradient>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0"   stop-color="#2c8ab4"/>
+      <stop offset=".45" stop-color="#146087"/>
+      <stop offset="1"   stop-color="#0a3350"/>
+    </linearGradient>
+    <linearGradient id="far" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a6c0cf"/>
+      <stop offset="1" stop-color="#6d94ac"/>
+    </linearGradient>
+    <linearGradient id="near" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#417760"/>
+      <stop offset="1" stop-color="#1d4234"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".5" cy=".5" r=".5">
+      <stop offset="0"  stop-color="#ffe3a8" stop-opacity=".95"/>
+      <stop offset=".5" stop-color="#ffe3a8" stop-opacity=".3"/>
+      <stop offset="1"  stop-color="#ffe3a8" stop-opacity="0"/>
+    </radialGradient>
+
+    <clipPath id="clipScene"><circle cx="300" cy="300" r="234"/></clipPath>
+    <path id="arcTop" d="M43,300 A257,257 0 0,1 557,300"/>
+    <path id="arcBot" d="M25,300 A275,275 0 0,0 575,300"/>
+  </defs>
+
+  <!-- ===== КОРПУС ЭМБЛЕМЫ ===== -->
+  <circle cx="300" cy="300" r="294" fill="#f7f1e1"/>
+  <circle cx="300" cy="300" r="294" fill="none" stroke="#0d3a52" stroke-width="6"/>
+  <circle cx="300" cy="300" r="286" fill="none" stroke="#0d3a52" stroke-width="1.5" opacity=".4"/>
+  <circle cx="300" cy="300" r="240" fill="none" stroke="#0d3a52" stroke-width="3"/>
+
+  <!-- ===== НАДПИСИ ПО КРУГУ ===== -->
+  <g fill="#0d3a52" text-anchor="middle" font-weight="700"
+     font-family="Georgia,'DejaVu Serif','Times New Roman',serif">
+    <text font-size="28" letter-spacing="3">
+      <textPath href="#arcTop" xlink:href="#arcTop" startOffset="50%">СОЧИНСКОЕ КРАЕВЕДЧЕСКОЕ ОБЩЕСТВО</textPath>
+    </text>
+    <text font-size="23" letter-spacing="4">
+      <textPath href="#arcBot" xlink:href="#arcBot" startOffset="50%">ГЕОГРАФИЯ • ИСТОРИЯ • СОЧИ</textPath>
+    </text>
+  </g>
+
+  <!-- ===== РОЗЫ ВЕТРОВ (стороны света) ===== -->
+  <g fill="#0d3a52">
+    <path d="M33,284 L37,296 L49,300 L37,304 L33,316 L29,304 L17,300 L29,296 Z"/>
+    <path d="M567,284 L571,296 L583,300 L571,304 L567,316 L563,304 L551,300 L563,296 Z"/>
+  </g>
+
+  <!-- ===== СЦЕНА ===== -->
+  <g clip-path="url(#clipScene)">
+    <circle cx="300" cy="300" r="234" fill="url(#sky)"/>
+    <circle cx="300" cy="198" r="130" fill="url(#glow)"/>
+    <circle cx="300" cy="198" r="46"  fill="#f7c755"/>
+
+    <!-- чайки -->
+    <g fill="none" stroke="#3d5f70" stroke-width="3" stroke-linecap="round" opacity=".6">
+      <path d="M152,170 C160,160 168,160 174,168 C180,160 188,160 196,170"/>
+      <path d="M406,152 C411,146 416,146 420,151 C424,146 429,146 434,152"/>
+    </g>
+
+    <!-- дальний хребет (Главный Кавказский) -->
+    <path d="M40,406 L110,246 L150,286 L212,206 L268,262 L320,214 L382,286 L428,242 L470,286 L560,406 Z" fill="url(#far)"/>
+    <g fill="#f1f8fb" opacity=".75">
+      <path d="M212,206 L234,228 L224,222 L214,236 L204,226 L187,238 Z"/>
+      <path d="M320,214 L345,243 L334,236 L323,250 L312,238 L299,233 Z"/>
+    </g>
+
+    <!-- ближний хребет (Ахун / Аибга) -->
+    <path d="M40,406 L96,330 L132,356 L196,262 L246,330 L292,296 L336,344 L398,272 L452,338 L500,306 L560,406 Z" fill="url(#near)"/>
+    <g fill="#eaf4f8" opacity=".9">
+      <path d="M196,262 L219,293 L207,285 L198,300 L188,286 L177,295 L167,304 Z"/>
+      <path d="M398,272 L422,302 L412,296 L403,310 L392,297 L381,301 L370,304 Z"/>
+    </g>
+
+    <!-- река, сбегающая к морю -->
+    <path d="M304,314 C296,338 312,352 300,372 C294,384 302,392 300,402"
+          fill="none" stroke="#bfe3f2" stroke-width="4.5" stroke-linecap="round" opacity=".55"/>
+
+    <!-- Чёрное море -->
+    <rect x="50" y="400" width="500" height="170" fill="url(#sea)"/>
+    <rect x="50" y="399" width="500" height="3" fill="#dff1f8" opacity=".7"/>
+
+    <!-- солнечная дорожка -->
+    <g fill="#ffd98a" opacity=".45">
+      <rect x="264" y="412" width="72" height="5" rx="2.5"/>
+      <rect x="282" y="428" width="40" height="4" rx="2"/>
+      <rect x="254" y="446" width="94" height="5" rx="2.5"/>
+      <rect x="286" y="464" width="34" height="4" rx="2"/>
+      <rect x="268" y="482" width="66" height="5" rx="2.5"/>
+    </g>
+
+    <!-- волны -->
+    <g fill="none" stroke="#cfe9f4" stroke-width="4" stroke-linecap="round" opacity=".4">
+      <path d="M104,438 q19,-8 38,0 t38,0 t38,0"/>
+      <path d="M352,430 q19,-8 38,0 t38,0 t38,0"/>
+      <path d="M326,498 q19,-8 38,0 t38,0"/>
+    </g>
+
+    <!-- скалистый мыс с античной колонной — ИСТОРИЯ побережья -->
+    <path d="M372,548 C372,500 380,470 392,452 C404,432 424,418 452,414 C486,410 510,430 518,462 L528,548 Z" fill="#54676f"/>
+    <path d="M392,452 C404,432 424,418 452,414 C486,410 510,430 518,462" fill="none" stroke="#8298a0" stroke-width="3"/>
+    <path d="M410,486 C424,470 442,462 462,462" fill="none" stroke="#42555d" stroke-width="3"/>
+    <path d="M368,506 C382,494 392,478 398,458" fill="none" stroke="#e8f5fa" stroke-width="5" stroke-linecap="round" opacity=".5"/>
+
+    <!-- колонна -->
+    <g stroke="#8a7a58" stroke-width="2">
+      <rect x="424" y="402" width="58" height="12" rx="2" fill="#e0d3b2"/>
+      <rect x="432" y="390" width="42" height="12" rx="2" fill="#ecdfc0"/>
+      <path d="M438,390 L441,326 L465,326 L468,390 Z" fill="#ecdfc0"/>
+      <path d="M434,326 L472,326 L466,316 L440,316 Z" fill="#ecdfc0"/>
+      <rect x="430" y="306" width="46" height="10" rx="1.5" fill="#f2e7cd"/>
+    </g>
+    <g stroke="#c7b489" stroke-width="1.8">
+      <path d="M446,332 L446,386"/><path d="M453,332 L453,386"/><path d="M460,332 L460,386"/>
+    </g>
+    <!-- упавший барабан колонны -->
+    <g transform="rotate(-14 400 430)">
+      <rect x="380" y="420" width="40" height="21" rx="9" fill="#e6dab9" stroke="#8a7a58" stroke-width="2"/>
+    </g>
+
+    <!-- галечный пляж -->
+    <path d="M112,486 C156,456 210,460 246,486 C272,504 282,524 288,552 L100,552 Z" fill="#cdb893"/>
+    <path d="M112,486 C156,456 210,460 246,486 C272,504 282,524 288,552"
+          fill="none" stroke="#eef7fa" stroke-width="5" stroke-linecap="round" opacity=".75"/>
+    <g fill="#a8926c" opacity=".8">
+      <ellipse cx="168" cy="504" rx="5" ry="3.4"/>
+      <ellipse cx="196" cy="516" rx="4" ry="3"/>
+      <ellipse cx="146" cy="520" rx="4.5" ry="3"/>
+      <ellipse cx="222" cy="502" rx="4" ry="2.8"/>
+      <ellipse cx="182" cy="534" rx="5" ry="3.2"/>
+      <ellipse cx="238" cy="528" rx="4" ry="2.8"/>
+      <ellipse cx="212" cy="544" rx="4.5" ry="3"/>
+    </g>
+
+    <!-- пальма -->
+    <path d="M186,494 C190,462 200,438 218,418" fill="none" stroke="#7a5230" stroke-width="11" stroke-linecap="round"/>
+    <g fill="none" stroke="#1f6b45" stroke-width="9" stroke-linecap="round">
+      <path d="M218,418 C198,398 174,390 150,394"/>
+      <path d="M218,418 C194,406 172,412 156,430"/>
+      <path d="M218,418 C236,396 260,388 284,392"/>
+      <path d="M218,418 C240,408 260,416 274,434"/>
+      <path d="M218,418 C218,398 222,380 230,364"/>
+    </g>
+    <circle cx="210" cy="424" r="5.5" fill="#8a5a2b"/>
+    <circle cx="226" cy="426" r="5.5" fill="#8a5a2b"/>
+  </g>
+
+  <!-- ===== ОБВОДКА СЦЕНЫ ===== -->
+  <circle cx="300" cy="300" r="234" fill="none" stroke="#0d3a52" stroke-width="7"/>
+  <circle cx="300" cy="300" r="226" fill="none" stroke="#c9a24a" stroke-width="2" opacity=".85"/>
+</svg>

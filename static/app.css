@@ -92,6 +92,28 @@ body {
     letter-spacing: 0.02em;
 }
 
+.brand-logo {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    flex-shrink: 0;
+}
+
+.webcam-shot {
+    margin-top: 12px;
+}
+
+.webcam-shot img {
+    max-width: 100%;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    display: block;
+}
+
+tr.row-current td {
+    background: rgba(37, 99, 235, 0.07);
+}
+
 .topbar-actions {
     display: flex;
     align-items: center;
