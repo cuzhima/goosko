@@ -375,6 +375,23 @@ def init_db():
             last_seen TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT NOT NULL,
+            username TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
+            ON login_attempts(ip, created_at);
+        CREATE INDEX IF NOT EXISTS idx_login_attempts_time
+            ON login_attempts(created_at);
+
+        CREATE TABLE IF NOT EXISTS system_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_active
             ON files(zone, rel_path) WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_files_owner ON files(owner);
@@ -446,7 +463,7 @@ def track_active_session():
         cur = get_db().execute(
             "UPDATE sessions SET last_seen=?, ip=?, user_agent=? WHERE sid=?",
             (
-                dbnow(), request.remote_addr,
+                dbnow(), real_client_ip(),
                 (request.headers.get("User-Agent") or "")[:200], sid,
             ),
         )
@@ -466,12 +483,91 @@ def register_session(username):
     db.execute(
         "INSERT INTO sessions (sid, username, ip, user_agent) VALUES (?,?,?,?)",
         (
-            sid, username, request.remote_addr,
+            sid, username, real_client_ip(),
             (request.headers.get("User-Agent") or "")[:200],
         ),
     )
     db.commit()
     return sid
+
+
+# =====================================================================
+# ЗАЩИТА ВХОДА ОТ ПОДБОРА ПАРОЛЯ
+# =====================================================================
+LOGIN_IP_FAIL_LIMIT = 3          # неверных паролей с одного адреса...
+LOGIN_IP_LOCK_SECONDS = 60       # ...и вход с него закрыт на минуту
+LOGIN_GLOBAL_FAIL_LIMIT = 10     # неверных паролей за минуту от всех...
+LOGIN_GLOBAL_LOCK_SECONDS = 300  # ...и вход закрыт для всех на 5 минут
+
+
+def _parse_db_dt_utc(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def login_lockout_state(ip):
+    """(заблокирован, осталось секунд, кто): 'ip' или 'all'.
+
+    Окно — последняя минута. Счётчик ведётся в БД, поэтому общий для всех
+    воркеров gunicorn и переживает рестарт.
+    """
+    db = get_db()
+    db.execute("DELETE FROM login_attempts WHERE created_at < datetime('now', '-1 day')")
+    db.commit()
+
+    row = db.execute(
+        "SELECT value FROM system_state WHERE key='login_lockout_until'"
+    ).fetchone()
+    now = datetime.now(timezone.utc)
+    if row:
+        until = _parse_db_dt_utc(row["value"])
+        if until and now < until:
+            return True, max(1, int((until - now).total_seconds())), "all"
+        db.execute("DELETE FROM system_state WHERE key='login_lockout_until'")
+        db.commit()
+
+    global_fails = db.execute(
+        "SELECT COUNT(*) FROM login_attempts "
+        "WHERE created_at >= datetime('now', '-60 seconds')"
+    ).fetchone()[0]
+    if global_fails > LOGIN_GLOBAL_FAIL_LIMIT:
+        until = now + timedelta(seconds=LOGIN_GLOBAL_LOCK_SECONDS)
+        db.execute(
+            "INSERT INTO system_state (key, value) VALUES ('login_lockout_until', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (until.strftime("%Y-%m-%d %H:%M:%S"),),
+        )
+        db.commit()
+        app.logger.warning("Login lockout: global, until %s", until.isoformat())
+        return True, LOGIN_GLOBAL_LOCK_SECONDS, "all"
+
+    ip_fails = db.execute(
+        "SELECT COUNT(*) FROM login_attempts "
+        "WHERE ip=? AND created_at >= datetime('now', '-60 seconds')",
+        (ip,),
+    ).fetchone()[0]
+    if ip_fails >= LOGIN_IP_FAIL_LIMIT:
+        row = db.execute(
+            "SELECT MAX(created_at) FROM login_attempts WHERE ip=?", (ip,)
+        ).fetchone()
+        left = LOGIN_IP_LOCK_SECONDS
+        last = _parse_db_dt_utc(row[0]) if row and row[0] else None
+        if last:
+            left = max(1, int(LOGIN_IP_LOCK_SECONDS - (now - last).total_seconds()))
+        return True, left, "ip"
+    return False, 0, ""
+
+
+def record_login_failure(ip, username):
+    db = get_db()
+    db.execute(
+        "INSERT INTO login_attempts (ip, username) VALUES (?,?)", (ip, username)
+    )
+    db.commit()
 
 
 # =====================================================================
@@ -522,6 +618,19 @@ def inject_globals():
     }
 
 
+def real_client_ip():
+    """Настоящий IP клиента.
+
+    Приоритет: CF-Connecting-IP (ставит Cloudflare, сквозь CF не подделать),
+    затем remote_addr — ProxyFix уже разобрал X-Forwarded-For, куда
+    tailscale-funnel подставляет tailnet-IP клиента, а Angie — LAN-адрес.
+    """
+    cf_ip = request.headers.get("CF-Connecting-IP", "").strip()
+    if cf_ip:
+        return cf_ip
+    return request.remote_addr
+
+
 # =====================================================================
 # АУДИТ
 # =====================================================================
@@ -531,7 +640,7 @@ def audit(action, details=""):
         db = get_db()
         db.execute(
             "INSERT INTO audit_log (username, action, details, ip) VALUES (?,?,?,?)",
-            (username, action, details, request.remote_addr),
+            (username, action, details, real_client_ip()),
         )
         db.commit()
     except Exception:
@@ -557,6 +666,7 @@ AUDIT_ACTION_LABELS = {
     "ssh_cert_revoked": "Отозван SSH-сертификат",
     "public_synced": "Синхронизация public",
     "system_action": "Системная команда",
+    "login_blocked": "Вход заблокирован",
     "log_cleared": "Журнал очищен",
     "reboot": "Перезагрузка",
     "shutdown": "Выключение",
@@ -1342,14 +1452,34 @@ def index():
 # ВХОД / ВЫХОД
 # =====================================================================
 @app.route("/login", methods=["POST"])
-@limiter.limit("10 per minute")
 def login():
     username = request.form.get("u", "").strip()
     password = request.form.get("p", "")
+    ip = real_client_ip()
+
+    blocked, seconds_left, scope = login_lockout_state(ip)
+    if blocked:
+        audit("login_blocked", f"{username or '?'}: {scope}, {seconds_left} c")
+        if scope == "all":
+            minutes = max(1, round(seconds_left / 60))
+            flash(
+                "⛔ Вход временно закрыт для всех из-за подозрительной "
+                f"активности. Попробуйте через {minutes} мин."
+            )
+        else:
+            flash(
+                "⛔ Слишком много неверных попыток с вашего адреса. "
+                f"Подождите {seconds_left} с и попробуйте снова."
+            )
+        return redirect("/")
+
     row = get_db().execute(
         "SELECT * FROM users WHERE username = ?", (username,)
     ).fetchone()
     if row and check_password_hash(row["password"], password):
+        db = get_db()
+        db.execute("DELETE FROM login_attempts WHERE ip=?", (ip,))
+        db.commit()
         session.clear()
         session["user"] = row["username"]
         session["is_admin"] = bool(row["is_admin"])
@@ -1357,6 +1487,7 @@ def login():
         session["sid"] = register_session(row["username"])
         audit("login_success", username)
         return redirect("/")
+    record_login_failure(ip, username)
     audit("login_failed", username)
     flash("Неверный логин или пароль")
     return redirect("/")
@@ -1684,7 +1815,7 @@ def upload_big(token):
         db = get_db()
         db.execute(
             "INSERT INTO audit_log (username, action, details, ip) VALUES (?,?,?,?)",
-            (username, "upload_big", f"{zone}:{rel_path}", request.remote_addr),
+            (username, "upload_big", f"{zone}:{rel_path}", real_client_ip()),
         )
         db.commit()
     except Exception:
@@ -2550,6 +2681,8 @@ def _build_system_status():
             "power": os.path.exists(POWER_HELPER),
             "disk": os.path.exists(DISK_HELPER),
             "funnel": os.path.exists(FUNNEL_HELPER),
+            "powerctl": os.path.exists(POWERCTL_HELPER),
+            "webcam": os.path.exists(WEBCAM_HELPER),
         },
     }
 
