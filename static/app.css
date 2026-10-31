@@ -92,13 +92,6 @@ body {
     letter-spacing: 0.02em;
 }
 
-.brand-logo {
-    width: 28px;
-    height: 28px;
-    border-radius: 6px;
-    flex-shrink: 0;
-}
-
 .webcam-shot {
     margin-top: 12px;
 }
@@ -439,6 +432,13 @@ tr:last-child td {
     flex-wrap: wrap;
     gap: 8px;
     align-items: center;
+}
+
+/* Компактный TTL-селект в форме «Поделиться» */
+.file-actions .ttl-select {
+    width: auto;
+    min-width: 0;
+    flex: 0 0 auto;
 }
 
 .inline-form {

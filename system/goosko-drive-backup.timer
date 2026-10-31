@@ -1,0 +1,11 @@
+[Unit]
+Description=goosko: daily timer for Google Drive files backup (после локального users.db 03:15)
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=goosko-drive-backup.service
+
+[Install]
+WantedBy=timers.target

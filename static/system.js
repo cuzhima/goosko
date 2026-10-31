@@ -114,7 +114,8 @@
         const helpers = data.helpers || {};
         const missing = byId("sys-helpers");
         if (missing) {
-            missing.hidden = helpers.display && helpers.power && helpers.disk && helpers.funnel;
+            missing.hidden = helpers.display && helpers.power && helpers.disk
+                && helpers.funnel && helpers.powerctl && helpers.webcam;
         }
 
         setText(
@@ -206,6 +207,39 @@
                 toast("Не удалось изменить яркость", "error");
             } finally {
                 applyBrightness.disabled = false;
+            }
+        });
+    }
+
+    // ===== Веб-камера =====
+    const shotBtn = byId("webcam-shot-btn");
+    const shotBox = byId("webcam-shot-box");
+    const shotImg = byId("webcam-shot-img");
+    if (shotBtn) {
+        shotBtn.addEventListener("click", async () => {
+            if (shotBtn.disabled) return;
+            shotBtn.disabled = true;
+            const original = shotBtn.textContent;
+            shotBtn.textContent = "Снимаем…";
+            try {
+                const response = await fetch("/admin/webcam", {
+                    method: "POST",
+                    credentials: "same-origin",
+                    headers: { "X-CSRFToken": csrf },
+                });
+                const data = await response.json();
+                if (data.ok && data.url) {
+                    shotImg.src = data.url;
+                    shotBox.hidden = false;
+                    toast("📸 Снимок готов", "ok");
+                } else {
+                    toast("Не удалось: " + (data.message || "ошибка камеры"), "error");
+                }
+            } catch (error) {
+                toast("Не удалось сделать снимок", "error");
+            } finally {
+                shotBtn.disabled = false;
+                shotBtn.textContent = original;
             }
         });
     }

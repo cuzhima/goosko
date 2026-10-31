@@ -1,0 +1,9 @@
+[Unit]
+Description=goosko: edge watchdog pass (рестарт cloudflared, если tunnel умер)
+Documentation=file:///usr/local/sbin/goosko-watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/goosko-watchdog

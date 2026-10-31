@@ -48,6 +48,25 @@ echo "  sysctl: применено"
 install -m 0644 "$SRC/00-goosko-map.conf" /etc/angie/http.d/00-goosko-map.conf
 echo "  angie: map установлен"
 
+# Синхронизация живого Angie-конфига из репо (source of truth = repo):
+# бэкап → установка → angie -t (при ошибке откат) → reload в конце скрипта.
+for angie_conf in goosko.conf 00-goosko-map.conf; do
+    src_conf="$SRC/$angie_conf"
+    dst_conf="/etc/angie/http.d/$angie_conf"
+    if [ -f "$src_conf" ] && [ -f "$dst_conf" ] && ! cmp -s "$src_conf" "$dst_conf"; then
+        cp -a "$dst_conf" "$dst_conf.bak-$(date +%Y%m%d-%H%M%S)"
+        install -m 0644 "$src_conf" "$dst_conf"
+        echo "  angie: $angie_conf обновлён из repo"
+    fi
+done
+if command -v angie >/dev/null 2>&1; then
+    if ! angie -t >/dev/null 2>&1; then
+        echo "Ссылка на angie -t провалилась — смотри angie -t" >&2
+        exit 1
+    fi
+    echo "  angie: конфигурация корректна"
+fi
+
 python3 "$SRC/patch-angie.py"
 python3 "$SRC/patch-fstab.py"
 
@@ -60,6 +79,21 @@ sed "s|/dev/sda|$DISK|g" "$SRC/goosko-disk-tune.service" \
     > /etc/systemd/system/goosko-disk-tune.service
 install -m 0644 "$SRC/goosko-thermal.service" /etc/systemd/system/goosko-thermal.service
 chmod 0644 /etc/systemd/system/goosko-disk-tune.service
+
+# Бэкап файлов в Google Drive + watchdog cloudflared
+for helper in goosko-drive-backup goosko-watchdog; do
+    if [ -f "$SRC/$helper" ]; then
+        install -m 0755 "$SRC/$helper" "$BIN/$helper"
+        echo "  helper: $BIN/$helper"
+    fi
+done
+for unit in goosko-drive-backup.service goosko-drive-backup.timer \
+            goosko-watchdog.service goosko-watchdog.timer; do
+    if [ -f "$SRC/$unit" ]; then
+        install -m 0644 "$SRC/$unit" "/etc/systemd/system/$unit"
+        echo "  unit: /etc/systemd/system/$unit"
+    fi
+done
 
 sed "s/^andrey /$TARGET_USER /" "$SRC/goosko-sudoers" > /etc/sudoers.d/goosko
 chmod 0440 /etc/sudoers.d/goosko
@@ -78,6 +112,23 @@ for unit in goosko-power.service goosko-disk-tune.service goosko-thermal.service
         echo "Внимание: $unit не запустился, смотрите journalctl -u $unit" >&2
     fi
 done
+
+# Вахтёр cloudflared — включаем сразу (безопасно: edge жив → просто выход).
+systemctl enable --now goosko-watchdog.timer 2>/dev/null \
+    && echo "  таймер: goosko-watchdog.timer (каждые 5 мин)" \
+    || echo "Внимание: goosko-watchdog.timer не активирован" >&2
+
+# Бэкап в Drive — только если уже настроен rclone (с OAuth и crypt).
+if [ -f "/home/$TARGET_USER/.config/rclone/rclone.conf" ] \
+   && grep -q '^\[goosko-drive\]' "/home/$TARGET_USER/.config/rclone/rclone.conf" \
+   && grep -q '^\[crypt\]' "/home/$TARGET_USER/.config/rclone/rclone.conf"; then
+    systemctl enable --now goosko-drive-backup.timer 2>/dev/null \
+        && echo "  таймер: goosko-drive-backup.timer (ежедневно 05:30)" \
+        || echo "Внимание: goosko-drive-backup.timer не активирован" >&2
+    chown "$TARGET_USER": "/home/$TARGET_USER/.config/rclone/rclone.conf" 2>/dev/null || true
+else
+    echo "  таймер: goosko-drive-backup НЕ включён — не настроен rclone (см. шаги активации)"
+fi
 
 if systemctl is-active --quiet angie.service; then
     systemctl reload angie.service || echo "Внимание: не удалось перезагрузить Angie" >&2

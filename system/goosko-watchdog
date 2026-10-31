@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# === goosko-watchdog: самовосстановление cloudflared ===
+#
+# Прошлый инцидент 24.10: cloudflared «Lost connection with the edge» и
+# умер молча — сайт лежал, пока не заметили вручную. Таймер дергает этот
+# скрипт раз в 5 минут; при недоступности edge — рестарт cloudflared.
+#
+# Edge-проба: https://goosko.online/healthz идёт через Cloudflare challenge,
+# curl всегда получает 403 — это ПРИЗНАК ЖИЗНИ (туннель и edge работают).
+# Проблема = таймаут (000) или 5xx (530/502/504 и т.п.). 200/403/429 — ок.
+#
+# Локальная проба 127.0.0.1:5000/healthz: если Flask лежит — cloudflared
+# не тронем (гасить туннель бессмысленно), только ERROR в журнал.
+set -uo pipefail
+
+EDGE_URL="${GOOSKO_EDGE_URL:-https://goosko.online/healthz}"
+LOCAL_URL="${GOOSKO_LOCAL_URL:-http://127.0.0.1:5000/healthz}"
+TIMEOUT="${GOOSKO_WATCHDOG_TIMEOUT:-20}"
+UNIT="${GOOSKO_CF_UNIT:-cloudflared}"
+
+log() { printf '[goosko-watchdog] %s %s\n' "$(date '+%F %T')" "$*"; }
+
+edge_ok() {
+    local code
+    code=$(curl -s -o /dev/null --max-time "$TIMEOUT" -w '%{http_code}' "$EDGE_URL" || echo 000)
+    log "edge-проба: HTTP ${code:-000}"
+    case "$code" in
+        200|301|302|403|429) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+local_ok() {
+    local code
+    code=$(curl -s -o /dev/null --max-time 5 -w '%{http_code}' "$LOCAL_URL" || echo 000)
+    [ "$code" = "200" ]
+}
+
+if ! local_ok; then
+    log "ERROR: локальный Flask не отвечает ($LOCAL_URL) — cloudflared не трогаю, смотреть journalctl -u goosko-web"
+    exit 1
+fi
+
+if edge_ok; then
+    exit 0
+fi
+
+if ! systemctl is-active --quiet "$UNIT" 2>/dev/null; then
+    log "$UNIT не активен — пробую старт"
+    systemctl start "$UNIT" || log "не удалось запустить $UNIT"
+else
+    log "edge недоступен ($EDGE_URL) — перезапускаю $UNIT"
+    systemctl restart "$UNIT" || log "не удалось перезапустить $UNIT"
+fi
+
+sleep 5
+if edge_ok; then
+    log "edge восстановлен после рестарта $UNIT"
+    exit 0
+fi
+
+log "edge всё ещё недоступен после рестарта — журнал: journalctl -u $UNIT -n 50"
+exit 1

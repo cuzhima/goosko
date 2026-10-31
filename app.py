@@ -86,6 +86,13 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", 4 * 1024 * 1024 * 1024))
 USER_QUOTA = int(os.environ.get("USER_QUOTA", 20 * 1024 * 1024 * 1024))
 TOKEN_TTL = int(os.environ.get("UPLOAD_TOKEN_TTL", 3600))
 SHARE_TTL_HOURS = int(os.environ.get("SHARE_TTL_HOURS", 24))
+SHARE_TTL_OPTIONS = (1, 8, 24, 72, 168)
+
+# Ретеншн для cleanup_stale_rows(): ручных кнопок больше не нужно
+SESSIONS_RETENTION_DAYS = int(os.environ.get("SESSIONS_RETENTION_DAYS", "30"))
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "90"))
+TRASH_RETENTION_DAYS = int(os.environ.get("TRASH_RETENTION_DAYS", "30"))
+CLEANUP_INTERVAL_SECONDS = int(os.environ.get("CLEANUP_INTERVAL_SECONDS", "3600"))
 
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://goosko.online").rstrip("/")
 PUBLIC_DOMAIN = ".goosko.online"  # домен cookie при входе через Cloudflare
@@ -476,6 +483,15 @@ def track_active_session():
         flash("Сессия завершена администратором.")
 
 
+@app.before_request
+def run_periodic_cleanup():
+    """Ретеншн-чистки раз в час на воркер (см. cleanup_stale_rows)."""
+    try:
+        cleanup_stale_rows()
+    except Exception:
+        app.logger.exception("Cleanup failed")
+
+
 def register_session(username):
     """Создаёт запись сессии (при входе) и возвращает sid для cookie."""
     sid = secrets.token_hex(16)
@@ -656,6 +672,9 @@ AUDIT_ACTION_LABELS = {
     "upload_big": "Большая загрузка",
     "biglink_created": "Ссылка для загрузки",
     "share_created": "Создана ссылка",
+    "share_revoked": "Отозвана ссылка",
+    "trash_autopurged": "Автоочистка корзины",
+    "password_reset": "Сброшен пароль",
     "delete": "Удаление",
     "restore": "Восстановление",
     "purge": "Удаление навсегда",
@@ -1140,13 +1159,68 @@ def purge_file_record(row):
     if trash_file and os.path.isfile(trash_file):
         try:
             os.remove(trash_file)
+        except FileNotFoundError:
+            pass  # файл уже исчез — считаем удалённым
         except OSError:
             app.logger.exception("Failed to remove trash file")
             return False
     db = get_db()
-    db.execute("DELETE FROM files WHERE id=?", (row["id"],))
+    # Guard deleted_at: не затираем запись, восстановленную параллельным запросом
+    db.execute(
+        "DELETE FROM files WHERE id=? AND deleted_at IS NOT NULL", (row["id"],)
+    )
     db.commit()
     return True
+
+
+# =====================================================================
+# ПЕРИОДИЧЕСКИЕ ЧИСТКИ (sessions / login_attempts / audit_log / корзина)
+# =====================================================================
+CLEANUP_INTERVAL = CLEANUP_INTERVAL_SECONDS
+_cleanup_at = 0.0
+
+
+def cleanup_stale_rows():
+    """Ретеншн таблиц и корзины. Общий на воркеры (SQLite), раз в час.
+
+    - sessions: старше SESSIONS_RETENTION_DAYS (последний last_seen);
+      живая сессия не пострадает — cookie живёт 12 ч, а before_request
+      обновляет last_seen на каждом запросе.
+    - login_attempts: старше 2 суток (со страховкой сверх окна брутфорса).
+    - audit_log: старше AUDIT_RETENTION_DAYS.
+    - корзина: файлы с deleted_at старше TRASH_RETENTION_DAYS — физическое
+      удаление (purge_file_record держит guard deleted_at).
+    """
+    global _cleanup_at
+    now = time.monotonic()
+    if now - _cleanup_at < CLEANUP_INTERVAL:
+        return
+    _cleanup_at = now
+
+    db = get_db()
+    db.execute(
+        "DELETE FROM sessions WHERE last_seen < datetime('now', ?)",
+        (f"-{SESSIONS_RETENTION_DAYS} days",),
+    )
+    db.execute("DELETE FROM login_attempts WHERE created_at < datetime('now', '-2 days')")
+    db.execute(
+        "DELETE FROM audit_log WHERE created_at < datetime('now', ?)",
+        (f"-{AUDIT_RETENTION_DAYS} days",),
+    )
+    db.commit()
+
+    cutoff = dbnow(utcnow() - timedelta(days=TRASH_RETENTION_DAYS))
+    stale = db.execute(
+        "SELECT * FROM files WHERE deleted_at IS NOT NULL AND deleted_at < ?",
+        (cutoff,),
+    ).fetchall()
+    purged = 0
+    for row in stale:
+        if purge_file_record(row):
+            purged += 1
+    if purged:
+        audit("trash_autopurged", f"count={purged}")
+        app.logger.info("Trash auto-purge: %d files", purged)
 
 
 # =====================================================================
@@ -1551,6 +1625,9 @@ def change_password():
         "UPDATE users SET password = ? WHERE username = ?",
         (generate_password_hash(new_password), session["user"]),
     )
+    # Пароль сменился → неверные все устройства: излишние сессии
+    # (в т.ч. украденные cookie) больше не должны проходить
+    db.execute("DELETE FROM sessions WHERE username=?", (session["user"],))
     db.commit()
     audit("password_changed", session["user"])
     session.clear()
@@ -1604,6 +1681,7 @@ def cloud():
         users=users, q=q, usage=usage, quota_percent=quota_percent,
         kind=kind, sort=sort,
         kind_labels=FILE_KIND_LABELS, sort_options=FILE_SORT_OPTIONS,
+        share_ttl_options=SHARE_TTL_OPTIONS,
     )
 
 
@@ -1838,17 +1916,51 @@ def share_file(file_id):
         flash("❌ Доступ запрещён")
         return redirect(url_for("cloud"))
 
+    try:
+        ttl_hours = int(request.form.get("ttl", SHARE_TTL_HOURS))
+    except (TypeError, ValueError):
+        ttl_hours = SHARE_TTL_HOURS
+    if ttl_hours not in SHARE_TTL_OPTIONS:
+        ttl_hours = SHARE_TTL_HOURS
+
     token = secrets.token_urlsafe(24)
-    expires = dbnow(utcnow() + timedelta(hours=SHARE_TTL_HOURS))
+    expires = dbnow(utcnow() + timedelta(hours=ttl_hours))
 
     db = get_db()
+    # Перезапись token'а — старая ссылка умирает мгновенно: один активный
+    # токен на файл (share_token хранится в строке файла).
     db.execute(
         "UPDATE files SET share_token=?, share_expires_at=? WHERE id=?",
         (token, expires, file_id),
     )
     db.commit()
     audit("share_created", row["rel_path"])
-    flash(f"🔗 Временная ссылка: {PUBLIC_BASE_URL}/share/{token}")
+    flash(
+        f"🔗 Временная ссылка ({ttl_hours} ч): "
+        f"{PUBLIC_BASE_URL}/share/{token}"
+    )
+    return redirect(url_for("cloud"))
+
+
+@app.route("/cloud/share/revoke/<int:file_id>", methods=["POST"])
+@login_required
+def share_revoke(file_id):
+    row = get_active_file_by_id(file_id)
+    if not row or not can_manage_file(row):
+        flash("❌ Файл не найден")
+        return redirect(url_for("cloud"))
+    if not row["share_token"]:
+        flash("Активной ссылку на этот файл нет")
+        return redirect(url_for("cloud"))
+
+    db = get_db()
+    db.execute(
+        "UPDATE files SET share_token=NULL, share_expires_at=NULL WHERE id=?",
+        (file_id,),
+    )
+    db.commit()
+    audit("share_revoked", row["rel_path"])
+    flash("🔓 Временная ссылка отозвана")
     return redirect(url_for("cloud"))
 
 
@@ -2324,6 +2436,37 @@ def del_user(uid):
 
 
 # =====================================================================
+# АДМИН: СБРОС ПАРОЛЯ ПОЛЬЗОВАТЕЛЯ
+# =====================================================================
+@app.route("/admin/reset/<int:uid>", methods=["POST"])
+@admin_required
+def admin_reset_password(uid):
+    db = get_db()
+    row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not row:
+        flash("❌ Пользователь не найден")
+        return redirect(url_for("index"))
+
+    username = row["username"]
+    if username == session["user"]:
+        flash("❌ Себе меняйте пароль в разделе «Аккаунт»")
+        return redirect(url_for("index"))
+
+    new_password = secrets.token_urlsafe(12)  # 16 симв., буквы+цифры есть
+    db.execute(
+        "UPDATE users SET password = ? WHERE id = ?",
+        (generate_password_hash(new_password), uid),
+    )
+    # Старые сессии этого пользователя недействительны сразу
+    db.execute("DELETE FROM sessions WHERE username=?", (username,))
+    db.commit()
+    audit("password_reset", username)
+    flash(f"🔑 Новый пароль для {username}: {new_password}")
+    flash("Передайте его пользователю — он сможет сменить его в «Аккаунте».")
+    return redirect(url_for("index"))
+
+
+# =====================================================================
 # 🔐 SSH-СТРАНИЦА
 # =====================================================================
 @app.route("/ssh")
@@ -2348,6 +2491,12 @@ def ssh_page():
 @admin_required
 @limiter.limit("5 per hour")
 def ssh_generate():
+    # Истёкшие key-бандлы (приватные ключи в памяти воркера) чистим здесь:
+    # иначе они живут до рестарта процесса.
+    now_ = time.time()
+    for stale_token in [k for k, v in SSH_BUNDLES.items() if v["expires"] < now_]:
+        SSH_BUNDLES.pop(stale_token, None)
+
     try:
         ttl = int(request.form.get("ttl", 60))
     except (TypeError, ValueError):
@@ -2764,6 +2913,32 @@ def system_action():
 def healthz():
     """Публичный healthcheck: nginx/мониторинг проверяют живость."""
     return _json_response({"ok": True, "sha": GIT_SHA}, 200)
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    """Личный сервис: индексируем только публичную зону."""
+    content = "\n".join([
+        "User-agent: *",
+        "Disallow: /login",
+        "Disallow: /logout",
+        "Disallow: /account",
+        "Disallow: /cloud",
+        "Disallow: /private",
+        "Disallow: /protected",
+        "Disallow: /public-protected",
+        "Disallow: /share",
+        "Disallow: /admin",
+        "Disallow: /system",
+        "Disallow: /ssh",
+        "Disallow: /upload-big",
+        "Disallow: /check",
+        "Disallow: /auth-check",
+        "Disallow: /healthz",
+        "Disallow: /static",
+        "",
+    ])
+    return Response(content, mimetype="text/plain")
 
 
 @app.route("/check")

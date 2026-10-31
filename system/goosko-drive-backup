@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# === goosko-drive-backup: файлы сайта → Google Drive (rclone) ===
+#
+#   public   → открыто:      goosko-drive:goosko/public
+#   private  → ЗАШИФРОВАНО:  crypt:private   (rclone crypt поверх drive)
+#   users.db → снимок в crypt:db/users-YYYYmmdd-HHMMSS.db, живёт DB_KEEP_DAYS
+#
+# Remotes задаются в ~/.config/rclone/rclone.conf:
+#   goosko-drive — Google Drive (OAuth, настраивается вручную один раз).
+#   crypt        — rclone crypt → goosko-drive:goosko.
+#                  Пароль и salt: /home/andrey/.goosko_backup (perms 600).
+#                  Восстановить бэкап на другой машине можно ТОЛЬКО с этим
+#                  файлом и тем же rclone — хранить его в надёжном месте!
+#
+# Расписание: systemd-timer goosko-drive-backup.timer (после локального
+# бэкапа users.db 03:15). Ручной прогон: /usr/local/sbin/goosko-drive-backup
+#
+# Восстановление (разово):
+#   public:  rclone copy goosko-drive:goosko/public /var/www/storage/public
+#   private: rclone copy crypt:private /var/www/storage/private
+#   db:      rclone copy crypt:db /tmp/db-restore
+#
+# Сухой прогон: goosko-drive-backup --dry-run (ничего не записывает в Drive)
+set -euo pipefail
+
+LOG_PREFIX="[goosko-drive-backup]"
+STORAGE_DIR="${STORAGE_DIR:-/var/www/storage}"
+SRC_PUBLIC="$STORAGE_DIR/public"
+SRC_PRIVATE="$STORAGE_DIR/private"
+DB_PATH="${DB_PATH:-/home/andrey/goosko-site/users.db}"
+REMOTE="${GOOSKO_DRIVE_REMOTE:-goosko-drive:}"
+CRYPT="${GOOSKO_CRYPT_REMOTE:-crypt:}"
+DB_KEEP_DAYS="${DB_KEEP_DAYS:-14}"
+
+DRY_RUN=""
+if [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN="--dry-run"
+fi
+
+log() { printf '%s %s %s\n' "$LOG_PREFIX" "$(date '+%F %T')" "$*"; }
+
+# rclone: системный или пользовательский статический бинарник
+RCLONE=""
+for cand in /usr/bin/rclone /usr/local/bin/rclone "$HOME/.local/bin/rclone"; do
+    if [ -x "$cand" ]; then RCLONE="$cand"; break; fi
+done
+if [ -z "$RCLONE" ]; then
+    log "rclone не найден (ожидается /usr/bin/rclone или ~/.local/bin/rclone). Выход."
+    exit 1
+fi
+export RCLONE_CONFIG="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
+
+log "старт, rclone $($RCLONE --version 2>/dev/null | head -1 | awk '{print $2}'), dry-run=$([ -n "$DRY_RUN" ] && echo yes || echo no)"
+log "источники: public=$(du -sh "$SRC_PUBLIC" 2>/dev/null | cut -f1), private=$(du -sh "$SRC_PRIVATE" 2>/dev/null | cut -f1)"
+
+# Свободное место на Drive — в журнал (оценка; при недоступности молча пропускаем)
+"$RCLONE" about "$REMOTE" 2>/dev/null | grep -iE '^(Used|Free|Trashed)' \
+    | while IFS= read -r line; do log "drive: $line"; done || true
+
+# --- 1. Публичная зона: как есть (без шифрования) ---
+log "копирую public → ${REMOTE}goosko/public"
+"$RCLONE" copy "$SRC_PUBLIC" "${REMOTE}goosko/public" \
+    --exclude "*.part" --exclude ".*" \
+    --transfers 4 --checkers 8 --drive-chunk-size 64M \
+    --stats 0 --log-level NOTICE $DRY_RUN
+
+# --- 2. Приватная зона: сквозь crypt (На Drive всё зашифровано) ---
+log "копирую private → ${CRYPT}private (зашифровано)"
+"$RCLONE" copy "$SRC_PRIVATE" "${CRYPT}private" \
+    --exclude "*.part" --exclude ".*" \
+    --transfers 4 --checkers 8 --drive-chunk-size 64M \
+    --stats 0 --log-level NOTICE $DRY_RUN
+
+# --- 3. users.db: снимок в crypt + ротация старше DB_KEEP_DAYS ---
+if [ -f "$DB_PATH" ]; then
+    TMPDIR_DB="$(mktemp -d)"
+    SNAP="$TMPDIR_DB/users-$(date +%Y%m%d-%H%M%S).db"
+    if sqlite3 "$DB_PATH" ".backup '$SNAP'"; then
+        if sqlite3 "$SNAP" "PRAGMA integrity_check;" | grep -q '^ok$'; then
+            log "копирую снимок users.db → ${CRYPT}db"
+            "$RCLONE" copy "$TMPDIR_DB" "${CRYPT}db" --stats 0 --log-level NOTICE $DRY_RUN
+            if [ -z "$DRY_RUN" ]; then
+                "$RCLONE" delete "${CRYPT}db" --min-age "${DB_KEEP_DAYS}d" >/dev/null 2>&1 || true
+            fi
+        else
+            log "integrity_check снимка users.db не прошёл — в Drive не выгружаю"
+        fi
+    else
+        log "не удалось сделать .backup users.db"
+    fi
+    rm -rf "$TMPDIR_DB"
+else
+    log "users.db не найден: $DB_PATH"
+fi
+
+log "завершено успешно"
+exit 0

@@ -1,0 +1,13 @@
+[Unit]
+Description=goosko: daily files backup to Google Drive (public plain, private encrypted)
+Documentation=file:///usr/local/sbin/goosko-drive-backup
+After=network-online.target goosko-db-backup.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=andrey
+ExecStart=/usr/local/sbin/goosko-drive-backup
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=4h

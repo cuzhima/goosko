@@ -113,6 +113,38 @@
 
 <div class="grid two">
     <div class="card">
+        <h2>⏻ Питание ПК</h2>
+        <p class="muted">Перезагрузка или выключение компьютера. Сайт, Termix и Cockpit станут недоступны.</p>
+        <div class="file-actions">
+            <form method="post" action="{{ url_for('admin_power') }}"
+                  data-confirm="Точно перезагрузить компьютер? Сайт будет недоступен пару минут.">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="action" value="reboot">
+                <button class="btn" type="submit">🔄 Перезагрузить</button>
+            </form>
+            <form method="post" action="{{ url_for('admin_power') }}"
+                  data-confirm="ВЫКЛЮЧИТЬ компьютер? Сайт будет недоступен, пока его не включат вручную!">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="action" value="shutdown">
+                <button class="btn danger" type="submit">⏻ Выключить</button>
+            </form>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>📷 Веб-камера</h2>
+        <p class="muted">Снимок с камеры моноблока сохраняется во временный файл и не хранится в облаке.</p>
+        <div class="file-actions">
+            <button class="btn primary" type="button" id="webcam-shot-btn">Сделать снимок</button>
+        </div>
+        <div id="webcam-shot-box" class="webcam-shot" hidden>
+            <img id="webcam-shot-img" alt="Снимок с камеры">
+        </div>
+    </div>
+</div>
+
+<div class="grid two">
+    <div class="card">
         <h2>🚀 Tailscale Funnel (ts.net)</h2>
         <p>Состояние: <strong id="funnel-state">—</strong></p>
         <p class="muted" id="funnel-url"></p>
@@ -139,5 +171,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='system.js', v='20261024d') }}" defer></script>
+<script src="{{ url_for('static', filename='system.js', v='20261026b') }}" defer></script>
 {% endblock %}

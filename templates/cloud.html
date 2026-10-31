@@ -221,18 +221,31 @@
                             <a class="btn small" href="{{ f.url }}">📥 Скачать</a>
                             <button class="btn small" type="button" data-copy="{{ f.full_url }}">📋 Копировать</button>
 
-                            <form method="post" action="{{ url_for('share_file', file_id=f.id) }}">
-                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                                <button class="btn small" type="submit">🔗 Поделиться 24ч</button>
-                            </form>
-
-                            {% if f.share_full %}
-                                <button class="btn small" type="button" data-copy="{{ f.share_full }}">
-                                    📋 Временная ссылка
-                                </button>
-                            {% endif %}
-
                             {% if f.can_delete %}
+                                <form method="post" action="{{ url_for('share_file', file_id=f.id) }}">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                    <select name="ttl" class="ttl-select" aria-label="Срок ссылки">
+                                        {% for t in share_ttl_options %}
+                                            <option value="{{ t }}" {% if t == 24 %}selected{% endif %}>{{ t }} ч</option>
+                                        {% endfor %}
+                                    </select>
+                                    <button class="btn small" type="submit">🔗 Поделиться</button>
+                                </form>
+
+                                {% if f.share_full %}
+                                    <button class="btn small" type="button" data-copy="{{ f.share_full }}">
+                                        📋 Копировать ссылку
+                                    </button>
+                                    <form
+                                        method="post"
+                                        action="{{ url_for('share_revoke', file_id=f.id) }}"
+                                        data-confirm="Отозвать временную ссылку? Она перестанет работать сразу."
+                                    >
+                                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                        <button class="btn small" type="submit">🔓 Отозвать</button>
+                                    </form>
+                                {% endif %}
+
                                 <form
                                     method="post"
                                     action="{{ url_for('cloud_delete', file_id=f.id) }}"
